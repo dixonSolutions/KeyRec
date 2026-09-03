@@ -16,7 +16,9 @@ the desktop shows no "microphone in use" icon. A desktop notification and
 `keyrec status` tell you the real state.
 
 - 🎙️ **One-key toggle** via a keyd hotkey (default `Ctrl+Alt+5`)
+- ⚡ **Instant** — the hotkey starts/stops recording in well under a tenth of a second
 - 🫥 **Stealth** — hides GNOME's microphone indicator while recording
+- 🔔 **Notifications** on start/stop that you can toggle (`keyrec notify off`)
 - 🗂️ **Your folder** — default `~/Documents/Recordings`, or pick one with a GUI dialog
 - 🕒 **Timestamped files** — named by the start date and exact time
 - 🛠️ **Everything tweakable from the CLI** — format, bitrate, source, hotkey, stealth…
@@ -61,6 +63,7 @@ keyrec status              # is it recording right now?  (add --json for scripts
 keyrec toggle              # start / stop from the terminal
 keyrec start               # start recording
 keyrec stop                # stop and save
+keyrec notify off          # silence start/stop notifications (on | off | toggle)
 keyrec where               # print the recordings folder
 keyrec sources             # list available microphones
 keyrec doctor              # health checks
@@ -74,6 +77,7 @@ keyrec doctor              # health checks
     folder  : /home/you/Documents/Recordings
     format  : opus
     stealth : on  (GNOME mic icon hidden)
+    notify  : on
     hotkey  : control+alt+5
 ```
 

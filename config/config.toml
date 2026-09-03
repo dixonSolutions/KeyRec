@@ -37,9 +37,12 @@ filename_prefix = "keyrec"
 stealth = true
 stealth_app_id = "org.gnome.VolumeControl"
 
-# Global hotkey, in keyd binding syntax. Bound via `keyd bind` by the daemon.
+# Global hotkey, in keyd binding syntax. Wired into your keyd config as a
+# non-destructive `include` by `keyrec apply-hotkey` (run for you by setup.sh,
+# and again automatically whenever you change this value).
 hotkey = "control+alt+5"
 
 # Show a desktop notification when recording starts and stops. Because the
 # mic indicator is hidden in stealth mode, this is your visible cue.
+# Toggle it any time with:  keyrec notify off  (or on / toggle)
 notify = true
