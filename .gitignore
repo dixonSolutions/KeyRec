@@ -1,0 +1,12 @@
+# runtime / local
+*.pyc
+__pycache__/
+*.log
+# local test artifacts
+scratch/
+*.opus
+*.ogg
+*.wav
+*.flac
+*.mp3
+*.m4a

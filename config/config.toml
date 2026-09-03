@@ -1,0 +1,45 @@
+# KeyRec — pre-configured system defaults
+# ---------------------------------------
+# This file is installed to /etc/keyrec/config.toml and read by the daemon.
+# Per-user tweaks made with `keyrec config set ...` are written to
+# ~/.config/keyrec/config.toml and override the values here.
+#
+# You can also edit this file directly, then run:  systemctl reload keyrec
+
+# Where recordings are written. "~" expands to the recording user's home.
+output_dir = "~/Documents/Recordings"
+
+# Audio format:  opus | vorbis | mp3 | aac | flac | wav
+#   opus  -> tiny, excellent for voice (default)
+#   flac  -> lossless, larger
+#   wav   -> uncompressed
+format = "opus"
+
+# Target bitrate for the lossy formats (opus / mp3 / aac).
+bitrate = "48k"
+
+# 1 = mono (good for a microphone), 2 = stereo
+channels = 1
+
+# Sample rate in Hz.
+samplerate = 48000
+
+# PulseAudio/PipeWire source to capture. "default" follows the system default
+# input. Run `keyrec sources` to see the available names.
+source = "default"
+
+# Recording files are named  <prefix>_<YYYY-MM-DD_HH-MM-SS>.<ext>
+filename_prefix = "keyrec"
+
+# Hide GNOME's top-bar microphone indicator while recording.
+# When true, the capture stream is tagged with an application id the GNOME
+# shell treats as internal, so no "microphone in use" icon appears.
+stealth = true
+stealth_app_id = "org.gnome.VolumeControl"
+
+# Global hotkey, in keyd binding syntax. Bound via `keyd bind` by the daemon.
+hotkey = "control+alt+5"
+
+# Show a desktop notification when recording starts and stops. Because the
+# mic indicator is hidden in stealth mode, this is your visible cue.
+notify = true

@@ -1,0 +1,32 @@
+[Unit]
+Description=KeyRec — hotkey-toggled microphone recorder
+Documentation=https://github.com/dixonSolutions/KeyRec
+After=keyd.service sound.target
+Wants=keyd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/keyrec daemon
+Restart=on-failure
+RestartSec=2
+
+# Runs as the desktop user so it can reach that user's PipeWire/PulseAudio
+# session and session bus. These placeholders are filled in by setup.sh.
+User=@USER@
+Group=@GROUP@
+
+# Point the daemon at the user's session (audio + notifications).
+Environment=HOME=@HOME@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+Environment=PULSE_SERVER=unix:/run/user/@UID@/pulse/native
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=KEYREC_BIN=/usr/local/bin/keyrec
+
+# Control socket + state file live here (owned by the service user).
+RuntimeDirectory=keyrec
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

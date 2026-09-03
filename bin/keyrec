@@ -1,0 +1,1116 @@
+#!/usr/bin/env python3
+"""
+KeyRec — a hotkey-toggled microphone recorder for Linux/GNOME.
+
+One key (Ctrl+Alt+5 by default, bound through keyd) toggles recording on and
+off. Recordings land in a folder you choose, named after the exact moment they
+started. While KeyRec is recording it hides GNOME's top-bar microphone
+indicator, so the desktop shows no "mic is on" icon.
+
+This single file is both the daemon (`keyrec daemon`, run by systemd) and the
+command-line client (`keyrec toggle`, `keyrec status`, `keyrec config ...`).
+
+See the README for the full story. The stealth mechanism is documented in
+docs/HOW-IT-WORKS.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Paths & defaults
+# ---------------------------------------------------------------------------
+
+# The control socket + runtime state live in a system runtime dir created by
+# systemd (RuntimeDirectory=keyrec). Overridable for local testing.
+RUNTIME_DIR = os.environ.get("KEYREC_RUNTIME_DIR", "/run/keyrec")
+SOCK_PATH = os.environ.get("KEYREC_SOCK", os.path.join(RUNTIME_DIR, "keyrec.sock"))
+STATE_PATH = os.environ.get("KEYREC_STATE", os.path.join(RUNTIME_DIR, "state.json"))
+
+SYSTEM_CONFIG = os.environ.get("KEYREC_SYSTEM_CONFIG", "/etc/keyrec/config.toml")
+USER_CONFIG = os.environ.get(
+    "KEYREC_USER_CONFIG",
+    os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "keyrec",
+        "config.toml",
+    ),
+)
+
+# The command keyd will run (as root) when the hotkey is pressed. It re-enters
+# this program as a thin client that pokes the daemon over the socket.
+INSTALL_PATH = os.environ.get("KEYREC_BIN", "/usr/local/bin/keyrec")
+TOGGLE_CMD = f"{INSTALL_PATH} toggle --source=hotkey"
+
+# keyd wiring. The hotkey is installed as an *include payload* (a file with no
+# extension, per keyd's rules) that is pulled into the keyd configs which own
+# your keyboards via an `include keyrec` line. This is non-destructive: it never
+# competes for devices the way a second `[ids] *` config would.
+KEYD_DIR = os.environ.get("KEYREC_KEYD_DIR", "/etc/keyd")
+KEYD_INCLUDE_NAME = "keyrec"
+KEYD_INCLUDE_FILE = os.path.join(KEYD_DIR, KEYD_INCLUDE_NAME)
+
+# Friendly modifier names -> keyd layer tokens.
+MODIFIER_ALIASES = {
+    "ctrl": "control", "control": "control",
+    "alt": "alt", "option": "alt", "opt": "alt",
+    "shift": "shift",
+    "super": "meta", "win": "meta", "cmd": "meta", "meta": "meta", "mod4": "meta",
+    "altgr": "altgr", "ralt": "altgr",
+}
+
+DEFAULT_CONFIG = {
+    "output_dir": "~/Documents/Recordings",
+    "format": "opus",            # opus | vorbis | mp3 | aac | flac | wav
+    "bitrate": "48k",            # used by lossy formats (opus/mp3/aac)
+    "channels": 1,               # 1 = mono, 2 = stereo
+    "samplerate": 48000,
+    "source": "default",         # pulse/pipewire source name, or "default"
+    "filename_prefix": "keyrec",
+    "stealth": True,             # hide the GNOME microphone indicator
+    "stealth_app_id": "org.gnome.VolumeControl",
+    "hotkey": "control+alt+5",   # keyd binding syntax
+    "notify": True,              # desktop notification on start/stop
+}
+
+# format -> (list of ffmpeg codec args, file extension)
+FORMATS = {
+    "opus":   (["-c:a", "libopus"], ".opus"),
+    "vorbis": (["-c:a", "libvorbis", "-q:a", "5"], ".ogg"),
+    "mp3":    (["-c:a", "libmp3lame"], ".mp3"),
+    "aac":    (["-c:a", "aac"], ".m4a"),
+    "flac":   (["-c:a", "flac"], ".flac"),
+    "wav":    (["-c:a", "pcm_s16le"], ".wav"),
+}
+LOSSY = {"opus", "mp3", "aac"}
+
+
+# ---------------------------------------------------------------------------
+# Minimal flat-TOML read/write (no third-party deps, works on any Python 3.6+)
+# Our config is a flat table of scalars, so we don't need a full TOML parser.
+# ---------------------------------------------------------------------------
+
+def _toml_load(path):
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return data
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.split(" #", 1)[0].strip()  # strip trailing comments
+        if not key:
+            continue
+        data[key] = _toml_value(val)
+    return data
+
+
+def _toml_value(val):
+    if (val.startswith('"') and val.endswith('"')) or (
+        val.startswith("'") and val.endswith("'")
+    ):
+        return val[1:-1]
+    low = val.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    try:
+        return float(val)
+    except ValueError:
+        pass
+    return val
+
+
+def _toml_dump(data, header=None):
+    out = []
+    if header:
+        out.append(header.rstrip() + "\n\n")
+    for key, val in data.items():
+        if isinstance(val, bool):
+            sval = "true" if val else "false"
+        elif isinstance(val, (int, float)):
+            sval = str(val)
+        else:
+            sval = '"' + str(val).replace('"', '\\"') + '"'
+        out.append(f"{key} = {sval}\n")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_config():
+    """Effective config = defaults < /etc/keyrec < ~/.config/keyrec."""
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(_toml_load(SYSTEM_CONFIG))
+    cfg.update(_toml_load(USER_CONFIG))
+    # keep only known keys, coerced to the default's type where possible
+    clean = {}
+    for key, default in DEFAULT_CONFIG.items():
+        val = cfg.get(key, default)
+        if isinstance(default, bool):
+            val = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes", "on")
+        elif isinstance(default, int) and not isinstance(val, bool):
+            try:
+                val = int(val)
+            except (ValueError, TypeError):
+                val = default
+        clean[key] = val
+    return clean
+
+
+def save_user_config(cfg):
+    """Persist the given config as the user override file."""
+    d = os.path.dirname(USER_CONFIG)
+    os.makedirs(d, exist_ok=True)
+    header = "# KeyRec user configuration (overrides /etc/keyrec/config.toml)\n" \
+             "# Written by `keyrec config set`. Safe to hand-edit."
+    tmp = USER_CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(_toml_dump(cfg, header))
+    os.replace(tmp, USER_CONFIG)
+
+
+def expand_output_dir(cfg):
+    return os.path.abspath(os.path.expanduser(str(cfg["output_dir"])))
+
+
+# ---------------------------------------------------------------------------
+# Hotkey -> keyd include payload
+# ---------------------------------------------------------------------------
+
+def parse_hotkey(hotkey):
+    """'control+alt+5' -> ('control+alt', '5').  'f9' -> ('main', 'f9')."""
+    parts = [p.strip().lower() for p in str(hotkey).split("+") if p.strip()]
+    if not parts:
+        raise ValueError("empty hotkey")
+    key = parts[-1]
+    mods = []
+    for m in parts[:-1]:
+        norm = MODIFIER_ALIASES.get(m)
+        if not norm:
+            raise ValueError(f"unknown modifier {m!r} in hotkey {hotkey!r}")
+        if norm not in mods:
+            mods.append(norm)
+    layer = "+".join(mods) if mods else "main"
+    return layer, key
+
+
+def render_keyd_include(hotkey, toggle_cmd=TOGGLE_CMD):
+    layer, key = parse_hotkey(hotkey)
+    return (
+        "# Generated by `keyrec apply-hotkey` — do not edit by hand.\n"
+        f"# Pressing {hotkey} runs: {toggle_cmd}\n"
+        f"[{layer}]\n"
+        f"{key} = command({toggle_cmd})\n"
+    )
+
+
+def _keyd_conf_files():
+    try:
+        names = sorted(os.listdir(KEYD_DIR))
+    except OSError:
+        return []
+    return [os.path.join(KEYD_DIR, n) for n in names if n.endswith(".conf")]
+
+
+def _file_has_ids(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip() == "[ids]":
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _insert_include(path):
+    """Add `include keyrec` after the first [ids] block. Returns a status str."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+    except OSError as exc:
+        return f"error: {exc}"
+    directive = f"include {KEYD_INCLUDE_NAME}"
+    if any(l.strip() == directive for l in lines):
+        return "already"
+    try:
+        idx = next(i for i, l in enumerate(lines) if l.strip() == "[ids]")
+    except StopIteration:
+        return "no-ids"
+    j = idx + 1
+    while j < len(lines) and lines[j].strip() and not lines[j].strip().startswith("["):
+        j += 1
+    # back up once
+    bak = path + ".keyrec-bak"
+    if not os.path.exists(bak):
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
+    lines.insert(j, directive)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+    except OSError as exc:
+        return f"error: {exc}"
+    return "added"
+
+
+def _remove_include(path):
+    directive = f"include {KEYD_INCLUDE_NAME}"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+    except OSError:
+        return "skip"
+    new = [l for l in lines if l.strip() != directive]
+    if len(new) == len(lines):
+        return "absent"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(new))
+    except OSError as exc:
+        return f"error: {exc}"
+    return "removed"
+
+
+def _keyd_reload():
+    if which("keyd"):
+        try:
+            subprocess.run(["keyd", "reload"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def which(name):
+    return shutil.which(name)
+
+
+def human_duration(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def log(msg):
+    ts = dt.datetime.now().strftime("%H:%M:%S")
+    print(f"[keyrec {ts}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self):
+        self.cfg = load_config()
+        self.lock = threading.RLock()
+        self.proc = None            # ffmpeg subprocess.Popen while recording
+        self.current_file = None
+        self.started_at = None
+        self._stop = threading.Event()
+        self._sock = None
+
+    # -- state ------------------------------------------------------------
+    def is_recording(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def state_dict(self):
+        rec = self.is_recording()
+        elapsed = (time.time() - self.started_at) if (rec and self.started_at) else 0
+        return {
+            "state": "recording" if rec else "idle",
+            "recording": rec,
+            "file": self.current_file if rec else None,
+            "started_at": self.started_at if rec else None,
+            "elapsed": round(elapsed, 1),
+            "elapsed_human": human_duration(elapsed) if rec else "00:00",
+            "output_dir": expand_output_dir(self.cfg),
+            "format": self.cfg["format"],
+            "stealth": bool(self.cfg["stealth"]),
+            "hotkey": self.cfg["hotkey"],
+            "pid": self.proc.pid if rec else None,
+        }
+
+    def persist_state(self):
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.state_dict(), fh)
+            os.replace(tmp, STATE_PATH)
+        except OSError as exc:
+            log(f"could not write state file: {exc}")
+
+    # -- recording --------------------------------------------------------
+    def _build_ffmpeg_cmd(self, outfile):
+        cfg = self.cfg
+        fmt = cfg["format"]
+        codec_args, _ext = FORMATS.get(fmt, FORMATS["opus"])
+        cmd = [
+            which("ffmpeg") or "ffmpeg",
+            "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+            "-f", "pulse",
+            "-name", "KeyRec",
+            "-i", str(cfg["source"] or "default"),
+            "-ac", str(cfg["channels"]),
+            "-ar", str(cfg["samplerate"]),
+        ]
+        cmd += codec_args
+        if fmt in LOSSY:
+            cmd += ["-b:a", str(cfg["bitrate"])]
+        cmd += [outfile]
+        return cmd
+
+    def _child_env(self):
+        env = dict(os.environ)
+        if self.cfg["stealth"]:
+            # This is the whole trick: libpulse stamps application.id onto our
+            # capture stream, and GNOME's shell skips streams whose
+            # application.id is one it considers "internal", so no mic icon.
+            env["PULSE_PROP"] = f"application.id={self.cfg['stealth_app_id']}"
+        return env
+
+    def start(self):
+        with self.lock:
+            if self.is_recording():
+                return {"ok": True, "already": True, **self.state_dict()}
+            outdir = expand_output_dir(self.cfg)
+            try:
+                os.makedirs(outdir, exist_ok=True)
+            except OSError as exc:
+                return {"ok": False, "error": f"cannot create output dir {outdir}: {exc}"}
+            fmt = self.cfg["format"]
+            ext = FORMATS.get(fmt, FORMATS["opus"])[1]
+            stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            name = f"{self.cfg['filename_prefix']}_{stamp}{ext}"
+            outfile = os.path.join(outdir, name)
+            cmd = self._build_ffmpeg_cmd(outfile)
+            try:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    env=self._child_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                self.proc = None
+                return {"ok": False, "error": f"failed to launch ffmpeg: {exc}"}
+
+            # Give ffmpeg a beat to fail fast (bad source, missing codec, ...)
+            time.sleep(0.35)
+            if self.proc.poll() is not None:
+                err = ""
+                try:
+                    err = self.proc.stderr.read().decode("utf-8", "replace").strip()
+                except Exception:
+                    pass
+                rc = self.proc.returncode
+                self.proc = None
+                return {"ok": False, "error": f"ffmpeg exited immediately (rc={rc}): {err[-500:]}"}
+
+            self.current_file = outfile
+            self.started_at = time.time()
+            self.persist_state()
+            log(f"recording -> {outfile} (stealth={'on' if self.cfg['stealth'] else 'off'})")
+            self.notify("🔴 KeyRec — recording", os.path.basename(outfile))
+            return {"ok": True, **self.state_dict()}
+
+    def stop(self):
+        with self.lock:
+            if not self.is_recording():
+                return {"ok": True, "already_idle": True, **self.state_dict()}
+            proc = self.proc
+            outfile = self.current_file
+            elapsed = time.time() - (self.started_at or time.time())
+            # SIGINT lets ffmpeg finalize the container (write the trailer).
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log("ffmpeg slow to finalize; sending SIGTERM")
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    log("ffmpeg unresponsive; killing")
+                    proc.kill()
+            self.proc = None
+            self.current_file = None
+            self.started_at = None
+            self.persist_state()
+
+            size = os.path.getsize(outfile) if outfile and os.path.exists(outfile) else 0
+            dur = human_duration(elapsed)
+            log(f"saved {outfile} ({size} bytes, {dur})")
+            if size > 0:
+                self.notify("⏹ KeyRec — saved",
+                            f"{os.path.basename(outfile)}  ·  {dur}")
+            else:
+                self.notify("⚠ KeyRec — empty recording",
+                            os.path.basename(outfile) if outfile else "")
+            return {"ok": True, "file": outfile, "size": size,
+                    "duration": round(elapsed, 1), "duration_human": dur,
+                    **self.state_dict()}
+
+    def toggle(self):
+        if self.is_recording():
+            return self.stop()
+        return self.start()
+
+    # -- notifications ----------------------------------------------------
+    def notify(self, title, body=""):
+        if not self.cfg["notify"]:
+            return
+        try:
+            if which("notify-send"):
+                subprocess.Popen(
+                    ["notify-send", "-a", "KeyRec", "-i",
+                     "audio-input-microphone-symbolic", title, body],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            log(f"notify failed: {exc}")
+
+    # -- socket server ----------------------------------------------------
+    def handle(self, req):
+        cmd = req.get("cmd")
+        if cmd == "ping":
+            return {"ok": True, "version": VERSION}
+        if cmd == "toggle":
+            return self.toggle()
+        if cmd == "start":
+            return self.start()
+        if cmd == "stop":
+            return self.stop()
+        if cmd == "status":
+            return {"ok": True, **self.state_dict()}
+        if cmd == "get-config":
+            return {"ok": True, "config": self.cfg}
+        if cmd == "set-config":
+            return self.apply_config_changes(req.get("changes", {}))
+        if cmd == "reload":
+            self.cfg = load_config()
+            self.persist_state()
+            return {"ok": True, "config": self.cfg}
+        return {"ok": False, "error": f"unknown command: {cmd!r}"}
+
+    def apply_config_changes(self, changes):
+        if not isinstance(changes, dict) or not changes:
+            return {"ok": False, "error": "no changes given"}
+        with self.lock:
+            merged = dict(_toml_load(USER_CONFIG))  # existing overrides
+            applied = {}
+            for key, val in changes.items():
+                if key not in DEFAULT_CONFIG:
+                    return {"ok": False, "error": f"unknown config key: {key}"}
+                default = DEFAULT_CONFIG[key]
+                if isinstance(default, bool):
+                    val = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes", "on")
+                elif isinstance(default, int) and not isinstance(val, bool):
+                    try:
+                        val = int(val)
+                    except (ValueError, TypeError):
+                        return {"ok": False, "error": f"{key} must be an integer"}
+                if key == "format" and val not in FORMATS:
+                    return {"ok": False, "error": f"format must be one of {', '.join(FORMATS)}"}
+                merged[key] = val
+                applied[key] = val
+            try:
+                save_user_config(merged)
+            except OSError as exc:
+                return {"ok": False, "error": f"could not write {USER_CONFIG}: {exc}"}
+            old_hotkey = self.cfg.get("hotkey")
+            self.cfg = load_config()
+            self.persist_state()
+            return {"ok": True, "applied": applied,
+                    "hotkey_changed": self.cfg.get("hotkey") != old_hotkey,
+                    "config": self.cfg}
+
+    def serve(self):
+        # Clean up a stale socket
+        try:
+            if os.path.exists(SOCK_PATH):
+                os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(SOCK_PATH), exist_ok=True)
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.bind(SOCK_PATH)
+        try:
+            os.chmod(SOCK_PATH, 0o660)
+        except OSError:
+            pass
+        self._sock.listen(8)
+        self._sock.settimeout(1.0)
+        log(f"listening on {SOCK_PATH}")
+
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                try:
+                    conn.settimeout(5)
+                    buf = b""
+                    while b"\n" not in buf:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    line = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+                    req = json.loads(line) if line else {}
+                    resp = self.handle(req)
+                except json.JSONDecodeError:
+                    resp = {"ok": False, "error": "invalid JSON request"}
+                except Exception as exc:
+                    resp = {"ok": False, "error": f"internal error: {exc}"}
+                try:
+                    conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+
+    # -- lifecycle --------------------------------------------------------
+    def run(self):
+        signal.signal(signal.SIGTERM, self._on_term)
+        signal.signal(signal.SIGINT, self._on_term)
+        signal.signal(signal.SIGUSR1, lambda *_: self.toggle())
+        try:
+            signal.signal(signal.SIGHUP, lambda *_: self._on_hup())
+        except (ValueError, AttributeError):
+            pass
+
+        log(f"KeyRec daemon {VERSION} starting")
+        self.persist_state()
+        try:
+            self.serve()
+        finally:
+            self.shutdown()
+
+    def _on_hup(self):
+        log("SIGHUP: reloading config")
+        self.cfg = load_config()
+        self.persist_state()
+
+    def _on_term(self, *_):
+        log("shutting down")
+        self._stop.set()
+
+    def shutdown(self):
+        if self.is_recording():
+            log("stopping in-progress recording before exit")
+            self.stop()
+        try:
+            if self._sock:
+                self._sock.close()
+        except OSError:
+            pass
+        try:
+            if os.path.exists(SOCK_PATH):
+                os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+class DaemonError(Exception):
+    pass
+
+
+def client_request(req, timeout=8):
+    if not os.path.exists(SOCK_PATH):
+        raise DaemonError(
+            f"KeyRec daemon socket not found at {SOCK_PATH}.\n"
+            "Is the service running?  Try:  systemctl status keyrec"
+        )
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK_PATH)
+    except (ConnectionRefusedError, FileNotFoundError, PermissionError) as exc:
+        raise DaemonError(f"cannot reach KeyRec daemon: {exc}")
+    try:
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    line = buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+    if not line:
+        raise DaemonError("empty response from daemon")
+    return json.loads(line)
+
+
+# ---------------------------------------------------------------------------
+# CLI command implementations
+# ---------------------------------------------------------------------------
+
+def cmd_daemon(args):
+    Daemon().run()
+    return 0
+
+
+def _print_status(st, as_json=False):
+    if as_json:
+        print(json.dumps(st, indent=2))
+        return
+    if st.get("recording"):
+        dot = "\033[31m●\033[0m"
+        print(f"{dot} RECORDING   {st['elapsed_human']}")
+        print(f"    file    : {st['file']}")
+    else:
+        print("\033[90m○\033[0m idle")
+    print(f"    folder  : {st['output_dir']}")
+    print(f"    format  : {st['format']}")
+    stealth = st.get("stealth")
+    print(f"    stealth : {'on  (GNOME mic icon hidden)' if stealth else 'off (mic icon shown)'}")
+    print(f"    hotkey  : {st['hotkey']}")
+
+
+def cmd_toggle(args):
+    resp = client_request({"cmd": "toggle"})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    if not args.quiet:
+        _print_status(resp)
+    return 0
+
+
+def cmd_start(args):
+    resp = client_request({"cmd": "start"})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    if not args.quiet:
+        _print_status(resp)
+    return 0
+
+
+def cmd_stop(args):
+    resp = client_request({"cmd": "stop"})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    if not args.quiet:
+        if resp.get("file") and resp.get("size"):
+            print(f"saved {resp['file']}  ({resp['duration_human']})")
+        _print_status(resp)
+    return 0
+
+
+def cmd_status(args):
+    try:
+        resp = client_request({"cmd": "status"})
+    except DaemonError as exc:
+        # Fall back to the on-disk state file if the socket is unavailable
+        if os.path.exists(STATE_PATH):
+            try:
+                with open(STATE_PATH) as fh:
+                    st = json.load(fh)
+                st["ok"] = True
+                _print_status(st, args.json)
+                return 0
+            except (OSError, json.JSONDecodeError):
+                pass
+        print("error:", exc, file=sys.stderr)
+        return 1
+    _print_status(resp, args.json)
+    return 0
+
+
+def cmd_config(args):
+    if args.config_action == "get":
+        resp = client_request({"cmd": "get-config"})
+        cfg = resp.get("config", {})
+        if args.key:
+            if args.key not in cfg:
+                print(f"unknown key: {args.key}", file=sys.stderr)
+                return 1
+            print(cfg[args.key])
+        else:
+            for k, v in cfg.items():
+                print(f"{k} = {v!r}")
+        return 0
+
+    if args.config_action == "set":
+        val = _coerce_cli_value(args.value)
+        resp = client_request({"cmd": "set-config", "changes": {args.key: val}})
+        if not resp.get("ok"):
+            print("error:", resp.get("error"), file=sys.stderr)
+            return 1
+        print(f"{args.key} = {resp['applied'][args.key]!r}")
+        if args.key == "hotkey" and resp.get("hotkey_changed"):
+            self_path = os.environ.get("KEYREC_BIN") or os.path.abspath(sys.argv[0])
+            print("activating the new hotkey (needs sudo)...")
+            subprocess.run(["sudo", self_path, "apply-hotkey"])
+        return 0
+
+    if args.config_action == "path":
+        return _pick_folder_and_set(use_gui=True)
+
+    return 1
+
+
+def _coerce_cli_value(val):
+    low = val.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    try:
+        return int(val)
+    except ValueError:
+        return val
+
+
+def _pick_folder_and_set(use_gui):
+    """Open a GUI folder picker (zenity) and set output_dir to the choice."""
+    if not which("zenity"):
+        print("zenity is not installed; set the folder with:\n"
+              "  keyrec config set output_dir /path/to/folder", file=sys.stderr)
+        return 1
+    try:
+        cur = client_request({"cmd": "get-config"}).get("config", {})
+        start_dir = os.path.expanduser(str(cur.get("output_dir", "~")))
+    except DaemonError:
+        start_dir = os.path.expanduser("~")
+    try:
+        res = subprocess.run(
+            ["zenity", "--file-selection", "--directory",
+             "--title=KeyRec — choose recordings folder",
+             f"--filename={start_dir}/"],
+            capture_output=True, text=True,
+        )
+    except Exception as exc:
+        print("could not launch zenity:", exc, file=sys.stderr)
+        return 1
+    if res.returncode != 0:
+        print("cancelled.")
+        return 1
+    chosen = res.stdout.strip()
+    if not chosen:
+        print("no folder chosen.")
+        return 1
+    resp = client_request({"cmd": "set-config", "changes": {"output_dir": chosen}})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    print(f"output_dir = {chosen}")
+    return 0
+
+
+def cmd_set_dir(args):
+    if args.gui or not args.path:
+        return _pick_folder_and_set(use_gui=True)
+    resp = client_request({"cmd": "set-config", "changes": {"output_dir": args.path}})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    print(f"output_dir = {resp['applied']['output_dir']}")
+    return 0
+
+
+def cmd_sources(args):
+    pactl = which("pactl")
+    if not pactl:
+        print("pactl not found.", file=sys.stderr)
+        return 1
+    out = subprocess.run([pactl, "list", "sources", "short"],
+                         capture_output=True, text=True)
+    default = subprocess.run([pactl, "get-default-source"],
+                             capture_output=True, text=True).stdout.strip()
+    print(f"default source: {default}\n")
+    print(out.stdout.rstrip())
+    return 0
+
+
+def cmd_where(args):
+    try:
+        st = client_request({"cmd": "status"})
+    except DaemonError as exc:
+        print("error:", exc, file=sys.stderr)
+        return 1
+    print(st["output_dir"])
+    return 0
+
+
+def cmd_doctor(args):
+    """Health check: dependencies, daemon, hotkey, stealth prediction."""
+    ok = True
+
+    def check(label, good, detail=""):
+        nonlocal ok
+        mark = "\033[32m✓\033[0m" if good else "\033[31m✗\033[0m"
+        print(f"  {mark} {label}" + (f"  — {detail}" if detail else ""))
+        if not good:
+            ok = False
+
+    print("KeyRec doctor\n")
+    check("ffmpeg installed", bool(which("ffmpeg")), which("ffmpeg") or "missing")
+    check("pactl installed", bool(which("pactl")), which("pactl") or "missing")
+    check("keyd installed", bool(which("keyd")), which("keyd") or "missing")
+    check("zenity (GUI folder picker)", bool(which("zenity")),
+          which("zenity") or "optional, missing")
+    check("notify-send (notifications)", bool(which("notify-send")),
+          which("notify-send") or "optional, missing")
+
+    daemon_ok = False
+    try:
+        resp = client_request({"cmd": "ping"})
+        daemon_ok = resp.get("ok", False)
+        check("daemon reachable", daemon_ok, f"v{resp.get('version')}")
+    except DaemonError as exc:
+        check("daemon reachable", False, str(exc).splitlines()[0])
+
+    if daemon_ok:
+        st = client_request({"cmd": "status"})
+        check("output folder writable",
+              _dir_writable(st["output_dir"]), st["output_dir"])
+        print(f"\n  hotkey        : {st['hotkey']}")
+        print(f"  stealth       : {'on' if st['stealth'] else 'off'}")
+        print(f"  current state : {st['state']}")
+
+    # keyd hotkey wiring present?
+    payload = os.path.exists(KEYD_INCLUDE_FILE)
+    included = any(
+        _file_has_ids(p) and any(
+            l.strip() == f"include {KEYD_INCLUDE_NAME}"
+            for l in open(p, encoding="utf-8", errors="ignore"))
+        for p in _keyd_conf_files()
+    )
+    check("keyd hotkey payload installed", payload, KEYD_INCLUDE_FILE)
+    check("keyd hotkey wired into a config", included,
+          "run: sudo keyrec apply-hotkey" if not included else "")
+
+    print()
+    print("all good ✅" if ok else "some checks failed ⚠")
+    return 0 if ok else 1
+
+
+def _dir_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def _reexec_root(subcmd):
+    """Re-run this command under sudo (prompts in the terminal)."""
+    self_path = os.environ.get("KEYREC_BIN") or os.path.abspath(sys.argv[0])
+    print(f"'{subcmd}' needs root — re-running with sudo...")
+    os.execvp("sudo", ["sudo", self_path, subcmd])
+
+
+def cmd_apply_hotkey(args):
+    """Write the keyd include payload and wire it into the keyboard configs."""
+    if os.geteuid() != 0:
+        _reexec_root("apply-hotkey")
+        return 1  # not reached
+    # Prefer the running daemon's effective config (it merges the right user
+    # override regardless of whose home root's process sees); fall back to disk.
+    hotkey = None
+    try:
+        hotkey = client_request({"cmd": "get-config"}).get("config", {}).get("hotkey")
+    except Exception:
+        pass
+    if not hotkey:
+        hotkey = load_config()["hotkey"]
+    try:
+        content = render_keyd_include(hotkey)
+    except ValueError as exc:
+        print("error:", exc, file=sys.stderr)
+        return 1
+    os.makedirs(KEYD_DIR, exist_ok=True)
+    with open(KEYD_INCLUDE_FILE, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.chmod(KEYD_INCLUDE_FILE, 0o644)
+    print(f"wrote {KEYD_INCLUDE_FILE}")
+    wired = 0
+    for path in _keyd_conf_files():
+        if not _file_has_ids(path):
+            continue
+        status = _insert_include(path)
+        print(f"  {os.path.basename(path)}: {status}")
+        if status in ("added", "already"):
+            wired += 1
+    if wired == 0:
+        print("  ! no keyd config with an [ids] section found to include into.")
+        print("    Add `include keyrec` after the [ids] line of your keyd config,")
+        print("    or create /etc/keyd/default.conf with:  [ids]\\n*")
+    _keyd_reload()
+    print(f"keyd reloaded — press {hotkey} to toggle recording.")
+    return 0
+
+
+def cmd_unbind_hotkey(args):
+    """Remove the keyd include payload and the include lines (for uninstall)."""
+    if os.geteuid() != 0:
+        _reexec_root("unbind-hotkey")
+        return 1
+    for path in _keyd_conf_files():
+        st = _remove_include(path)
+        if st == "removed":
+            print(f"  {os.path.basename(path)}: include removed")
+    try:
+        os.remove(KEYD_INCLUDE_FILE)
+        print(f"removed {KEYD_INCLUDE_FILE}")
+    except OSError:
+        pass
+    _keyd_reload()
+    print("hotkey unbound.")
+    return 0
+
+
+def cmd_version(args):
+    print(f"KeyRec {VERSION}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="keyrec",
+        description="Hotkey-toggled microphone recorder that hides GNOME's mic indicator.",
+    )
+    p.add_argument("--version", action="store_true", help="print version and exit")
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("daemon", help="run the recording daemon (used by systemd)")
+
+    sp = sub.add_parser("toggle", help="start/stop recording")
+    sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--source", default=None, help=argparse.SUPPRESS)  # e.g. hotkey
+
+    sp = sub.add_parser("start", help="start recording")
+    sp.add_argument("--quiet", action="store_true")
+    sp = sub.add_parser("stop", help="stop recording")
+    sp.add_argument("--quiet", action="store_true")
+
+    sp = sub.add_parser("status", help="show current recording state")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sp = sub.add_parser("config", help="view or change configuration")
+    csub = sp.add_subparsers(dest="config_action")
+    g = csub.add_parser("get", help="print config (optionally one KEY)")
+    g.add_argument("key", nargs="?")
+    s = csub.add_parser("set", help="set KEY to VALUE")
+    s.add_argument("key")
+    s.add_argument("value")
+    csub.add_parser("path", help="pick the recordings folder with a GUI dialog")
+
+    sp = sub.add_parser("set-dir", help="set the recordings folder (path or --gui)")
+    sp.add_argument("path", nargs="?")
+    sp.add_argument("--gui", action="store_true", help="use the GUI folder picker")
+
+    sub.add_parser("sources", help="list available input sources")
+    sub.add_parser("where", help="print the recordings folder")
+    sub.add_parser("doctor", help="run health checks")
+    sub.add_parser("apply-hotkey",
+                   help="(re)install the keyd hotkey binding (uses sudo)")
+    sub.add_parser("unbind-hotkey",
+                   help="remove the keyd hotkey binding (uses sudo)")
+    sub.add_parser("version", help="print version")
+
+    return p
+
+
+DISPATCH = {
+    "daemon": cmd_daemon,
+    "toggle": cmd_toggle,
+    "start": cmd_start,
+    "stop": cmd_stop,
+    "status": cmd_status,
+    "config": cmd_config,
+    "set-dir": cmd_set_dir,
+    "sources": cmd_sources,
+    "where": cmd_where,
+    "doctor": cmd_doctor,
+    "apply-hotkey": cmd_apply_hotkey,
+    "unbind-hotkey": cmd_unbind_hotkey,
+    "version": cmd_version,
+}
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        return cmd_version(args)
+    if not args.command:
+        parser.print_help()
+        return 1
+    handler = DISPATCH.get(args.command)
+    if not handler:
+        parser.print_help()
+        return 1
+    try:
+        return handler(args)
+    except DaemonError as exc:
+        print("error:", exc, file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
