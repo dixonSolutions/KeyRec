@@ -1,5 +1,5 @@
 [Unit]
-Description=KeyRec — hotkey-toggled microphone recorder
+Description=KeyRec — hotkey-toggled microphone + camera recorder
 Documentation=https://github.com/dixonSolutions/KeyRec
 After=keyd.service sound.target
 Wants=keyd.service

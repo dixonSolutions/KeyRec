@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-KeyRec — a hotkey-toggled microphone recorder for Linux/GNOME.
+KeyRec — hotkey-toggled microphone *and* camera recorder for Linux/GNOME.
 
-One key (Ctrl+Alt+5 by default, bound through keyd) toggles recording on and
-off. Recordings land in a folder you choose, named after the exact moment they
-started. While KeyRec is recording it hides GNOME's top-bar microphone
-indicator, so the desktop shows no "mic is on" icon.
+Two independent hotkeys toggle two independent recorders:
+
+  * Ctrl+Alt+6  → microphone audio recording
+  * Ctrl+Alt+7  → camera video recording (with audio, by default)
+
+Each toggle starts/stops on its own; they can run at the same time. Both draw
+their audio from one shared block of microphone settings (source, channels,
+sample rate, volume), applied as a per-stream software gain — so running both at
+once never changes your real device level and the two never interfere.
+
+While the microphone is capturing, KeyRec hides GNOME's top-bar microphone
+indicator (stealth mode). NOTE: the camera's physical activity LED is wired to
+the sensor in hardware and cannot be turned off in software — video recording
+will light it. See docs/HOW-IT-WORKS.md.
 
 This single file is both the daemon (`keyrec daemon`, run by systemd) and the
-command-line client (`keyrec toggle`, `keyrec status`, `keyrec config ...`).
-
-See the README for the full story. The stealth mechanism is documented in
-docs/HOW-IT-WORKS.md.
+command-line client (`keyrec toggle [audio|video]`, `keyrec status`, ...).
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
 import re
@@ -30,7 +38,7 @@ import sys
 import threading
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths & defaults
@@ -41,9 +49,17 @@ VERSION = "1.1.0"
 RUNTIME_DIR = os.environ.get("KEYREC_RUNTIME_DIR", "/run/keyrec")
 SOCK_PATH = os.environ.get("KEYREC_SOCK", os.path.join(RUNTIME_DIR, "keyrec.sock"))
 STATE_PATH = os.environ.get("KEYREC_STATE", os.path.join(RUNTIME_DIR, "state.json"))
-# ffmpeg's stderr is redirected here (not a pipe) so a long recording can never
-# stall on a full pipe buffer, and so start-failures can be read back.
+# Each recorder's ffmpeg stderr is redirected to its own file (not a pipe) so a
+# long recording can never stall on a full pipe buffer, and so start-failures
+# can be read back. Derived from a base path (env-overridable).
 FFMPEG_LOG = os.environ.get("KEYREC_FFMPEG_LOG", os.path.join(RUNTIME_DIR, "ffmpeg.log"))
+
+
+def _ffmpeg_log(kind):
+    """Per-recorder ffmpeg log path, e.g. .../ffmpeg-audio.log."""
+    base, ext = os.path.splitext(FFMPEG_LOG)
+    return f"{base}-{kind}{ext or '.log'}"
+
 
 SYSTEM_CONFIG = os.environ.get("KEYREC_SYSTEM_CONFIG", "/etc/keyrec/config.toml")
 USER_CONFIG = os.environ.get(
@@ -55,15 +71,20 @@ USER_CONFIG = os.environ.get(
     ),
 )
 
-# The command keyd will run (as root) when the hotkey is pressed. It re-enters
+# The command keyd will run (as root) when a hotkey is pressed. It re-enters
 # this program as a thin client that pokes the daemon over the socket.
 INSTALL_PATH = os.environ.get("KEYREC_BIN", "/usr/local/bin/keyrec")
-TOGGLE_CMD = f"{INSTALL_PATH} toggle --source=hotkey"
 
-# keyd wiring. The hotkey is installed as an *include payload* (a file with no
-# extension, per keyd's rules) that is pulled into the keyd configs which own
-# your keyboards via an `include keyrec` line. This is non-destructive: it never
-# competes for devices the way a second `[ids] *` config would.
+
+def _toggle_cmd(target):
+    return f"{INSTALL_PATH} toggle {target} --source=hotkey"
+
+
+# keyd wiring. The hotkeys are installed as a single *include payload* (a file
+# with no extension, per keyd's rules) that is pulled into the keyd configs
+# which own your keyboards via an `include keyrec` line. This is
+# non-destructive: it never competes for devices the way a second `[ids] *`
+# config would.
 KEYD_DIR = os.environ.get("KEYREC_KEYD_DIR", "/etc/keyd")
 KEYD_INCLUDE_NAME = "keyrec"
 KEYD_INCLUDE_FILE = os.path.join(KEYD_DIR, KEYD_INCLUDE_NAME)
@@ -79,19 +100,39 @@ MODIFIER_ALIASES = {
 
 DEFAULT_CONFIG = {
     "output_dir": "~/Documents/Recordings",
-    "format": "opus",            # opus | vorbis | mp3 | aac | flac | wav
-    "bitrate": "48k",            # used by lossy formats (opus/mp3/aac)
+
+    # --- shared microphone settings (used by BOTH audio and video recorders) -
+    # These describe the one microphone. Both recorders read from the same
+    # source with these settings; the volume is applied as a per-stream
+    # software gain, so the real device level is never touched and two
+    # simultaneous captures never interfere with each other.
+    "source": "default",         # pulse/pipewire source name, or "default"
     "channels": 1,               # 1 = mono, 2 = stereo
     "samplerate": 48000,
-    "source": "default",         # pulse/pipewire source name, or "default"
+    "mic_volume": 100,           # percent gain applied to captured audio (100 = unchanged)
+
+    # --- audio recording ----------------------------------------------------
+    "format": "opus",            # opus | vorbis | mp3 | aac | flac | wav
+    "bitrate": "48k",            # used by lossy formats (opus/mp3/aac)
+    "hotkey": "control+alt+6",   # keyd binding syntax — toggles audio recording
+
+    # --- video recording ----------------------------------------------------
+    "camera": "default",         # v4l2 device path, or "default" (first /dev/video*)
+    "video_format": "mp4",       # mp4 | mkv | webm
+    "video_resolution": "default",   # WxH (e.g. 1280x720) or "default" (camera picks)
+    "video_framerate": "default",    # fps (e.g. 30) or "default"
+    "video_bitrate": "4M",       # target video bitrate
+    "video_audio": True,         # include the microphone in the video (mute with false)
+    "video_hotkey": "control+alt+7",  # keyd binding syntax — toggles video recording
+
+    # --- shared behaviour ---------------------------------------------------
     "filename_prefix": "keyrec",
-    "stealth": True,             # hide the GNOME microphone indicator
+    "stealth": True,             # hide the GNOME microphone indicator (audio only)
     "stealth_app_id": "org.gnome.VolumeControl",
-    "hotkey": "control+alt+5",   # keyd binding syntax
     "notify": True,              # desktop notification on start/stop
 }
 
-# format -> (list of ffmpeg codec args, file extension)
+# audio format -> (ffmpeg audio-codec args, file extension)
 FORMATS = {
     "opus":   (["-c:a", "libopus"], ".opus"),
     "vorbis": (["-c:a", "libvorbis", "-q:a", "5"], ".ogg"),
@@ -101,6 +142,16 @@ FORMATS = {
     "wav":    (["-c:a", "pcm_s16le"], ".wav"),
 }
 LOSSY = {"opus", "mp3", "aac"}
+
+# video format -> (video-codec args, audio-codec args, extension)
+VIDEO_FORMATS = {
+    "mp4":  (["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"],
+             ["-c:a", "aac", "-b:a", "128k"], ".mp4"),
+    "mkv":  (["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"],
+             ["-c:a", "aac", "-b:a", "128k"], ".mkv"),
+    "webm": (["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "5"],
+             ["-c:a", "libopus", "-b:a", "128k"], ".webm"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -206,12 +257,22 @@ def expand_output_dir(cfg):
     return os.path.abspath(os.path.expanduser(str(cfg["output_dir"])))
 
 
+def resolve_camera(cfg):
+    """Turn the `camera` setting into a concrete /dev/video* device path."""
+    cam = str(cfg.get("camera", "default") or "default").strip()
+    if cam and cam != "default":
+        return cam
+    devs = sorted(glob.glob("/dev/video*"),
+                  key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+    return devs[0] if devs else "/dev/video0"
+
+
 # ---------------------------------------------------------------------------
 # Hotkey -> keyd include payload
 # ---------------------------------------------------------------------------
 
 def parse_hotkey(hotkey):
-    """'control+alt+5' -> ('control+alt', '5').  'f9' -> ('main', 'f9')."""
+    """'control+alt+6' -> ('control+alt', '6').  'f9' -> ('main', 'f9')."""
     parts = [p.strip().lower() for p in str(hotkey).split("+") if p.strip()]
     if not parts:
         raise ValueError("empty hotkey")
@@ -227,14 +288,29 @@ def parse_hotkey(hotkey):
     return layer, key
 
 
-def render_keyd_include(hotkey, toggle_cmd=TOGGLE_CMD):
-    layer, key = parse_hotkey(hotkey)
-    return (
-        "# Generated by `keyrec apply-hotkey` — do not edit by hand.\n"
-        f"# Pressing {hotkey} runs: {toggle_cmd}\n"
-        f"[{layer}]\n"
-        f"{key} = command({toggle_cmd})\n"
-    )
+def render_keyd_include(bindings):
+    """Render one keyd include payload for a list of (hotkey, command) pairs.
+
+    Keys that share the same modifier layer are grouped into one block, which
+    is what keyd expects (two `[control+alt]` blocks would be redundant).
+    """
+    layers = {}   # layer -> list of (key, command), preserving order
+    order = []
+    notes = []
+    for hotkey, cmd in bindings:
+        layer, key = parse_hotkey(hotkey)
+        if layer not in layers:
+            layers[layer] = []
+            order.append(layer)
+        layers[layer].append((key, cmd))
+        notes.append(f"#   {hotkey} runs: {cmd}")
+    out = ["# Generated by `keyrec apply-hotkey` — do not edit by hand."]
+    out.extend(notes)
+    for layer in order:
+        out.append(f"[{layer}]")
+        for key, cmd in layers[layer]:
+            out.append(f"{key} = command({cmd})")
+    return "\n".join(out) + "\n"
 
 
 def _keyd_conf_files():
@@ -346,18 +422,25 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
-# Daemon
+# Recorder — one independent capture (audio or video)
 # ---------------------------------------------------------------------------
 
-class Daemon:
-    def __init__(self):
-        self.cfg = load_config()
+class Recorder:
+    """A single toggleable capture. Two of these (audio + video) live inside
+    the daemon and run completely independently of each other."""
+
+    def __init__(self, daemon, kind):
+        self.daemon = daemon          # for cfg + notify
+        self.kind = kind              # "audio" | "video"
         self.lock = threading.RLock()
-        self.proc = None            # ffmpeg subprocess.Popen while recording
+        self.proc = None              # ffmpeg subprocess.Popen while recording
         self.current_file = None
         self.started_at = None
-        self._stop = threading.Event()
-        self._sock = None
+        self.ffmpeg_log = _ffmpeg_log(kind)
+
+    @property
+    def cfg(self):
+        return self.daemon.cfg
 
     # -- state ------------------------------------------------------------
     def is_recording(self):
@@ -367,78 +450,134 @@ class Daemon:
         rec = self.is_recording()
         elapsed = (time.time() - self.started_at) if (rec and self.started_at) else 0
         return {
-            "state": "recording" if rec else "idle",
             "recording": rec,
             "file": self.current_file if rec else None,
             "started_at": self.started_at if rec else None,
             "elapsed": round(elapsed, 1),
             "elapsed_human": human_duration(elapsed) if rec else "00:00",
-            "output_dir": expand_output_dir(self.cfg),
-            "format": self.cfg["format"],
-            "stealth": bool(self.cfg["stealth"]),
-            "notify": bool(self.cfg["notify"]),
-            "hotkey": self.cfg["hotkey"],
             "pid": self.proc.pid if rec else None,
         }
 
-    def persist_state(self):
-        try:
-            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-            tmp = STATE_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.state_dict(), fh)
-            os.replace(tmp, STATE_PATH)
-        except OSError as exc:
-            log(f"could not write state file: {exc}")
+    # -- shared audio input ----------------------------------------------
+    def _audio_input_args(self):
+        """The pulse input flags shared by both recorders."""
+        return ["-f", "pulse", "-name", "KeyRec",
+                "-i", str(self.cfg["source"] or "default")]
 
-    # -- recording --------------------------------------------------------
-    def _build_ffmpeg_cmd(self, outfile):
+    def _mic_gain_filter(self):
+        """Software gain from mic_volume (percent). None when it's 100/off."""
+        try:
+            vol = int(self.cfg.get("mic_volume", 100))
+        except (TypeError, ValueError):
+            vol = 100
+        if vol == 100:
+            return None
+        return f"volume={max(vol, 0) / 100.0:.4f}"
+
+    # -- ffmpeg command per kind -----------------------------------------
+    def build_cmd(self, outfile):
+        return (self._build_audio_cmd if self.kind == "audio"
+                else self._build_video_cmd)(outfile)
+
+    def _build_audio_cmd(self, outfile):
         cfg = self.cfg
         fmt = cfg["format"]
         codec_args, _ext = FORMATS.get(fmt, FORMATS["opus"])
-        cmd = [
-            which("ffmpeg") or "ffmpeg",
-            "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-            "-f", "pulse",
-            "-name", "KeyRec",
-            "-i", str(cfg["source"] or "default"),
-            "-ac", str(cfg["channels"]),
-            "-ar", str(cfg["samplerate"]),
-        ]
+        cmd = [which("ffmpeg") or "ffmpeg",
+               "-hide_banner", "-loglevel", "warning", "-nostdin", "-y"]
+        cmd += self._audio_input_args()
+        cmd += ["-ac", str(cfg["channels"]), "-ar", str(cfg["samplerate"])]
+        gain = self._mic_gain_filter()
+        if gain:
+            cmd += ["-af", gain]
         cmd += codec_args
         if fmt in LOSSY:
             cmd += ["-b:a", str(cfg["bitrate"])]
         cmd += [outfile]
         return cmd
 
+    def _build_video_cmd(self, outfile):
+        cfg = self.cfg
+        fmt = cfg["video_format"]
+        vcodec, acodec, _ext = VIDEO_FORMATS.get(fmt, VIDEO_FORMATS["mp4"])
+        cam = resolve_camera(cfg)
+        with_audio = bool(cfg.get("video_audio", True))
+
+        cmd = [which("ffmpeg") or "ffmpeg",
+               "-hide_banner", "-loglevel", "warning", "-nostdin", "-y"]
+
+        # --- camera (video) input; input options must precede the -i ---
+        res = str(cfg.get("video_resolution", "default") or "default").strip()
+        if res and res != "default":
+            cmd += ["-video_size", res]
+        fps = str(cfg.get("video_framerate", "default") or "default").strip()
+        if fps and fps != "default":
+            cmd += ["-framerate", fps]
+        cmd += ["-f", "v4l2", "-i", cam]
+
+        # --- microphone (audio) input, shared settings ---
+        if with_audio:
+            cmd += self._audio_input_args()
+            cmd += ["-ac", str(cfg["channels"]), "-ar", str(cfg["samplerate"])]
+            # Explicit mapping so ffmpeg pairs camera video with mic audio.
+            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+            gain = self._mic_gain_filter()
+            if gain:
+                cmd += ["-af", gain]
+        else:
+            cmd += ["-map", "0:v:0"]
+
+        cmd += vcodec
+        if str(cfg.get("video_bitrate", "")).strip():
+            cmd += ["-b:v", str(cfg["video_bitrate"])]
+        if with_audio:
+            cmd += acodec
+        cmd += [outfile]
+        return cmd
+
+    # -- child environment (stealth) -------------------------------------
     def _child_env(self):
         env = dict(os.environ)
-        if self.cfg["stealth"]:
-            # This is the whole trick: libpulse stamps application.id onto our
-            # capture stream, and GNOME's shell skips streams whose
-            # application.id is one it considers "internal", so no mic icon.
+        # Stealth hides GNOME's *microphone* icon by stamping application.id
+        # onto our capture stream. It applies to any recorder that opens the
+        # mic (audio always; video when it includes audio). It cannot hide the
+        # camera's hardware LED.
+        opens_mic = self.kind == "audio" or bool(self.cfg.get("video_audio", True))
+        if self.cfg["stealth"] and opens_mic:
             env["PULSE_PROP"] = f"application.id={self.cfg['stealth_app_id']}"
         return env
 
+    def _outfile(self):
+        outdir = expand_output_dir(self.cfg)
+        os.makedirs(outdir, exist_ok=True)
+        if self.kind == "audio":
+            ext = FORMATS.get(self.cfg["format"], FORMATS["opus"])[1]
+            tag = ""
+        else:
+            ext = VIDEO_FORMATS.get(self.cfg["video_format"], VIDEO_FORMATS["mp4"])[2]
+            tag = "_video"
+        stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        name = f"{self.cfg['filename_prefix']}{tag}_{stamp}{ext}"
+        return os.path.join(outdir, name)
+
+    # -- lifecycle --------------------------------------------------------
     def start(self):
         with self.lock:
             if self.is_recording():
-                return {"ok": True, "already": True, **self.state_dict()}
+                return {"ok": True, "already": True, "target": self.kind,
+                        **self.state_dict()}
             outdir = expand_output_dir(self.cfg)
             try:
                 os.makedirs(outdir, exist_ok=True)
             except OSError as exc:
-                return {"ok": False, "error": f"cannot create output dir {outdir}: {exc}"}
-            fmt = self.cfg["format"]
-            ext = FORMATS.get(fmt, FORMATS["opus"])[1]
-            stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            name = f"{self.cfg['filename_prefix']}_{stamp}{ext}"
-            outfile = os.path.join(outdir, name)
-            cmd = self._build_ffmpeg_cmd(outfile)
+                return {"ok": False, "target": self.kind,
+                        "error": f"cannot create output dir {outdir}: {exc}"}
+            outfile = self._outfile()
+            cmd = self.build_cmd(outfile)
             # Redirect ffmpeg's stderr to a file (not a pipe): a pipe we never
             # drain would eventually fill and stall a long recording.
             try:
-                log_fh = open(FFMPEG_LOG, "wb")
+                log_fh = open(self.ffmpeg_log, "wb")
             except OSError:
                 log_fh = subprocess.DEVNULL
             try:
@@ -456,7 +595,8 @@ class Daemon:
                         log_fh.close()
                     except OSError:
                         pass
-                return {"ok": False, "error": f"failed to launch ffmpeg: {exc}"}
+                return {"ok": False, "target": self.kind,
+                        "error": f"failed to launch ffmpeg: {exc}"}
             if hasattr(log_fh, "close"):
                 # ffmpeg holds its own dup of the fd; drop the parent's copy.
                 try:
@@ -470,14 +610,24 @@ class Daemon:
             self.proc = proc
             self.current_file = outfile
             self.started_at = time.time()
-            self.persist_state()
+            self.daemon.persist_state()
             state = self.state_dict()
 
-        log(f"recording -> {outfile} (stealth={'on' if self.cfg['stealth'] else 'off'})")
-        self.notify("🔴 KeyRec — recording", os.path.basename(outfile))
+        if self.kind == "audio":
+            log(f"audio recording -> {outfile} "
+                f"(stealth={'on' if self.cfg['stealth'] else 'off'})")
+            self.daemon.notify("🔴 KeyRec — recording", os.path.basename(outfile),
+                               icon="audio-input-microphone-symbolic")
+        else:
+            aud = "with audio" if self.cfg.get("video_audio", True) else "muted"
+            log(f"video recording -> {outfile} "
+                f"(camera={resolve_camera(self.cfg)}, {aud})")
+            self.daemon.notify("🎥 KeyRec — recording video",
+                               os.path.basename(outfile) + "  ·  camera LED is on",
+                               icon="camera-web-symbolic")
         threading.Thread(target=self._watch_start, args=(proc, outfile),
                          daemon=True).start()
-        return {"ok": True, **state}
+        return {"ok": True, "target": self.kind, **state}
 
     def _watch_start(self, proc, outfile):
         """Async fail-fast: if ffmpeg exits on its own shortly after launch,
@@ -493,16 +643,17 @@ class Daemon:
             self.proc = None
             self.current_file = None
             self.started_at = None
-            self.persist_state()
-        err = _read_text(FFMPEG_LOG)
+            self.daemon.persist_state()
+        err = _read_text(self.ffmpeg_log)
         detail = (err.splitlines()[-1] if err else f"ffmpeg exited (rc={rc})")[:140]
-        log(f"ffmpeg exited immediately (rc={rc}): {err[-500:]}")
-        self.notify("⚠ KeyRec — couldn’t record", detail)
+        log(f"{self.kind} ffmpeg exited immediately (rc={rc}): {err[-500:]}")
+        self.daemon.notify(f"⚠ KeyRec — couldn’t record {self.kind}", detail)
 
     def stop(self):
         with self.lock:
             if not self.is_recording():
-                return {"ok": True, "already_idle": True, **self.state_dict()}
+                return {"ok": True, "already_idle": True, "target": self.kind,
+                        **self.state_dict()}
             proc = self.proc
             outfile = self.current_file
             started = self.started_at
@@ -511,7 +662,7 @@ class Daemon:
             self.proc = None
             self.current_file = None
             self.started_at = None
-            self.persist_state()
+            self.daemon.persist_state()
             state = self.state_dict()
 
         # SIGINT lets ffmpeg finalize the container (write the trailer). The
@@ -525,44 +676,110 @@ class Daemon:
         dur = human_duration(elapsed)
         threading.Thread(target=self._finalize, args=(proc, outfile, elapsed, dur),
                          daemon=True).start()
-        return {"ok": True, "file": outfile, "stopping": True,
+        return {"ok": True, "target": self.kind, "file": outfile, "stopping": True,
                 "duration": round(elapsed, 1), "duration_human": dur, **state}
 
     def _finalize(self, proc, outfile, elapsed, dur):
         """Wait for ffmpeg to flush, then report the saved file (async)."""
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
-            log("ffmpeg slow to finalize; sending SIGTERM")
+            log(f"{self.kind} ffmpeg slow to finalize; sending SIGTERM")
             try:
                 proc.terminate()
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                log("ffmpeg unresponsive; killing")
+                log(f"{self.kind} ffmpeg unresponsive; killing")
                 proc.kill()
         size = os.path.getsize(outfile) if outfile and os.path.exists(outfile) else 0
         log(f"saved {outfile} ({size} bytes, {dur})")
+        label = "video" if self.kind == "video" else ""
         if size > 0:
-            self.notify("⏹ KeyRec — saved",
-                        f"{os.path.basename(outfile)}  ·  {dur}")
+            self.daemon.notify(f"⏹ KeyRec — {label} saved".replace("  ", " "),
+                               f"{os.path.basename(outfile)}  ·  {dur}")
         else:
-            self.notify("⚠ KeyRec — empty recording",
-                        os.path.basename(outfile) if outfile else "")
+            self.daemon.notify(f"⚠ KeyRec — empty {self.kind} recording",
+                               os.path.basename(outfile) if outfile else "")
 
     def toggle(self):
         if self.is_recording():
             return self.stop()
         return self.start()
 
+    def force_stop_blocking(self):
+        """Used on daemon shutdown: signal + wait so the file is flushed."""
+        with self.lock:
+            if not self.is_recording():
+                return
+            proc = self.proc
+            outfile = self.current_file
+            started = self.started_at
+            self.proc = None
+            self.current_file = None
+            self.started_at = None
+            self.daemon.persist_state()
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        elapsed = time.time() - (started or time.time())
+        self._finalize(proc, outfile, elapsed, human_duration(elapsed))
+
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self):
+        self.cfg = load_config()
+        self.audio = Recorder(self, "audio")
+        self.video = Recorder(self, "video")
+        self._stop = threading.Event()
+        self._sock = None
+
+    def recorder(self, target):
+        return self.video if target == "video" else self.audio
+
+    # -- state ------------------------------------------------------------
+    def state_dict(self):
+        a = self.audio.state_dict()
+        v = self.video.state_dict()
+        return {
+            "audio": a,
+            "video": v,
+            # convenience top-level "any recording?" flag
+            "recording": a["recording"] or v["recording"],
+            "output_dir": expand_output_dir(self.cfg),
+            "format": self.cfg["format"],
+            "video_format": self.cfg["video_format"],
+            "camera": resolve_camera(self.cfg),
+            "mic_volume": int(self.cfg.get("mic_volume", 100)),
+            "video_audio": bool(self.cfg.get("video_audio", True)),
+            "stealth": bool(self.cfg["stealth"]),
+            "notify": bool(self.cfg["notify"]),
+            "hotkey": self.cfg["hotkey"],
+            "video_hotkey": self.cfg["video_hotkey"],
+        }
+
+    def persist_state(self):
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.state_dict(), fh)
+            os.replace(tmp, STATE_PATH)
+        except OSError as exc:
+            log(f"could not write state file: {exc}")
+
     # -- notifications ----------------------------------------------------
-    def notify(self, title, body=""):
+    def notify(self, title, body="", icon="audio-input-microphone-symbolic"):
         if not self.cfg["notify"]:
             return
         try:
             if which("notify-send"):
                 subprocess.Popen(
-                    ["notify-send", "-a", "KeyRec", "-i",
-                     "audio-input-microphone-symbolic", title, body],
+                    ["notify-send", "-a", "KeyRec", "-i", icon, title, body],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -572,14 +789,17 @@ class Daemon:
     # -- socket server ----------------------------------------------------
     def handle(self, req):
         cmd = req.get("cmd")
+        target = req.get("target", "audio")
+        if target not in ("audio", "video"):
+            return {"ok": False, "error": f"unknown target: {target!r}"}
         if cmd == "ping":
             return {"ok": True, "version": VERSION}
         if cmd == "toggle":
-            return self.toggle()
+            return {**self.recorder(target).toggle(), **self.state_dict()}
         if cmd == "start":
-            return self.start()
+            return {**self.recorder(target).start(), **self.state_dict()}
         if cmd == "stop":
-            return self.stop()
+            return {**self.recorder(target).stop(), **self.state_dict()}
         if cmd == "status":
             return {"ok": True, **self.state_dict()}
         if cmd == "get-config":
@@ -595,34 +815,38 @@ class Daemon:
     def apply_config_changes(self, changes):
         if not isinstance(changes, dict) or not changes:
             return {"ok": False, "error": "no changes given"}
-        with self.lock:
-            merged = dict(_toml_load(USER_CONFIG))  # existing overrides
-            applied = {}
-            for key, val in changes.items():
-                if key not in DEFAULT_CONFIG:
-                    return {"ok": False, "error": f"unknown config key: {key}"}
-                default = DEFAULT_CONFIG[key]
-                if isinstance(default, bool):
-                    val = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes", "on")
-                elif isinstance(default, int) and not isinstance(val, bool):
-                    try:
-                        val = int(val)
-                    except (ValueError, TypeError):
-                        return {"ok": False, "error": f"{key} must be an integer"}
-                if key == "format" and val not in FORMATS:
-                    return {"ok": False, "error": f"format must be one of {', '.join(FORMATS)}"}
-                merged[key] = val
-                applied[key] = val
-            try:
-                save_user_config(merged)
-            except OSError as exc:
-                return {"ok": False, "error": f"could not write {USER_CONFIG}: {exc}"}
-            old_hotkey = self.cfg.get("hotkey")
-            self.cfg = load_config()
-            self.persist_state()
-            return {"ok": True, "applied": applied,
-                    "hotkey_changed": self.cfg.get("hotkey") != old_hotkey,
-                    "config": self.cfg}
+        merged = dict(_toml_load(USER_CONFIG))  # existing overrides
+        applied = {}
+        for key, val in changes.items():
+            if key not in DEFAULT_CONFIG:
+                return {"ok": False, "error": f"unknown config key: {key}"}
+            default = DEFAULT_CONFIG[key]
+            if isinstance(default, bool):
+                val = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes", "on")
+            elif isinstance(default, int) and not isinstance(val, bool):
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    return {"ok": False, "error": f"{key} must be an integer"}
+            if key == "format" and val not in FORMATS:
+                return {"ok": False, "error": f"format must be one of {', '.join(FORMATS)}"}
+            if key == "video_format" and val not in VIDEO_FORMATS:
+                return {"ok": False, "error": f"video_format must be one of {', '.join(VIDEO_FORMATS)}"}
+            if key == "mic_volume" and val < 0:
+                return {"ok": False, "error": "mic_volume must be >= 0"}
+            merged[key] = val
+            applied[key] = val
+        try:
+            save_user_config(merged)
+        except OSError as exc:
+            return {"ok": False, "error": f"could not write {USER_CONFIG}: {exc}"}
+        old_hotkeys = (self.cfg.get("hotkey"), self.cfg.get("video_hotkey"))
+        self.cfg = load_config()
+        self.persist_state()
+        new_hotkeys = (self.cfg.get("hotkey"), self.cfg.get("video_hotkey"))
+        return {"ok": True, "applied": applied,
+                "hotkey_changed": new_hotkeys != old_hotkeys,
+                "config": self.cfg}
 
     def serve(self):
         # Clean up a stale socket
@@ -674,7 +898,8 @@ class Daemon:
     def run(self):
         signal.signal(signal.SIGTERM, self._on_term)
         signal.signal(signal.SIGINT, self._on_term)
-        signal.signal(signal.SIGUSR1, lambda *_: self.toggle())
+        signal.signal(signal.SIGUSR1, lambda *_: self.audio.toggle())
+        signal.signal(signal.SIGUSR2, lambda *_: self.video.toggle())
         try:
             signal.signal(signal.SIGHUP, lambda *_: self._on_hup())
         except (ValueError, AttributeError):
@@ -697,24 +922,10 @@ class Daemon:
         self._stop.set()
 
     def shutdown(self):
-        if self.is_recording():
-            log("stopping in-progress recording before exit")
-            with self.lock:
-                proc = self.proc
-                outfile = self.current_file
-                started = self.started_at
-                self.proc = None
-                self.current_file = None
-                self.started_at = None
-                self.persist_state()
-            try:
-                proc.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            elapsed = time.time() - (started or time.time())
-            # Block here (unlike the async stop path) so the file is fully
-            # flushed before the daemon exits.
-            self._finalize(proc, outfile, elapsed, human_duration(elapsed))
+        for rec in (self.audio, self.video):
+            if rec.is_recording():
+                log(f"stopping in-progress {rec.kind} recording before exit")
+                rec.force_stop_blocking()
         try:
             if self._sock:
                 self._sock.close()
@@ -776,50 +987,51 @@ def _print_status(st, as_json=False):
     if as_json:
         print(json.dumps(st, indent=2))
         return
-    if st.get("recording"):
-        dot = "\033[31m●\033[0m"
-        print(f"{dot} RECORDING   {st['elapsed_human']}")
-        print(f"    file    : {st['file']}")
+    a = st.get("audio", {})
+    v = st.get("video", {})
+    if a.get("recording"):
+        print(f"\033[31m●\033[0m AUDIO recording   {a['elapsed_human']}")
+        print(f"    file    : {a['file']}")
     else:
-        print("\033[90m○\033[0m idle")
-    print(f"    folder  : {st['output_dir']}")
-    print(f"    format  : {st['format']}")
+        print("\033[90m○\033[0m audio idle")
+    if v.get("recording"):
+        print(f"\033[31m●\033[0m VIDEO recording   {v['elapsed_human']}  \033[90m(camera LED on)\033[0m")
+        print(f"    file    : {v['file']}")
+    else:
+        print("\033[90m○\033[0m video idle")
+    print(f"    folder    : {st.get('output_dir')}")
+    print(f"    audio fmt : {st.get('format')}")
+    print(f"    video fmt : {st.get('video_format')}   camera: {st.get('camera')}")
+    print(f"    mic vol   : {st.get('mic_volume')}%")
+    print(f"    video mic : {'on (video has audio)' if st.get('video_audio', True) else 'muted'}")
     stealth = st.get("stealth")
-    print(f"    stealth : {'on  (GNOME mic icon hidden)' if stealth else 'off (mic icon shown)'}")
-    print(f"    notify  : {'on' if st.get('notify', True) else 'off'}")
-    print(f"    hotkey  : {st['hotkey']}")
+    print(f"    stealth   : {'on  (GNOME mic icon hidden)' if stealth else 'off (mic icon shown)'}")
+    print(f"    notify    : {'on' if st.get('notify', True) else 'off'}")
+    print(f"    hotkeys   : audio {st.get('hotkey')}   video {st.get('video_hotkey')}")
 
 
-def cmd_toggle(args):
-    resp = client_request({"cmd": "toggle"})
+def _toggle_like(cmd, args):
+    resp = client_request({"cmd": cmd, "target": args.target})
     if not resp.get("ok"):
         print("error:", resp.get("error"), file=sys.stderr)
         return 1
     if not args.quiet:
-        _print_status(resp)
-    return 0
-
-
-def cmd_start(args):
-    resp = client_request({"cmd": "start"})
-    if not resp.get("ok"):
-        print("error:", resp.get("error"), file=sys.stderr)
-        return 1
-    if not args.quiet:
-        _print_status(resp)
-    return 0
-
-
-def cmd_stop(args):
-    resp = client_request({"cmd": "stop"})
-    if not resp.get("ok"):
-        print("error:", resp.get("error"), file=sys.stderr)
-        return 1
-    if not args.quiet:
-        if resp.get("file"):
+        if cmd == "stop" and resp.get("file"):
             print(f"saved {resp['file']}  ({resp.get('duration_human', '')})")
         _print_status(resp)
     return 0
+
+
+def cmd_toggle(args):
+    return _toggle_like("toggle", args)
+
+
+def cmd_start(args):
+    return _toggle_like("start", args)
+
+
+def cmd_stop(args):
+    return _toggle_like("stop", args)
 
 
 def cmd_status(args):
@@ -863,7 +1075,7 @@ def cmd_config(args):
             print("error:", resp.get("error"), file=sys.stderr)
             return 1
         print(f"{args.key} = {resp['applied'][args.key]!r}")
-        if args.key == "hotkey" and resp.get("hotkey_changed"):
+        if args.key in ("hotkey", "video_hotkey") and resp.get("hotkey_changed"):
             self_path = os.environ.get("KEYREC_BIN") or os.path.abspath(sys.argv[0])
             print("activating the new hotkey (needs sudo)...")
             subprocess.run(["sudo", self_path, "apply-hotkey"])
@@ -948,6 +1160,33 @@ def cmd_sources(args):
     return 0
 
 
+def cmd_cameras(args):
+    """List available V4L2 camera devices."""
+    devs = sorted(glob.glob("/dev/video*"),
+                  key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+    if not devs:
+        print("no /dev/video* devices found.", file=sys.stderr)
+        return 1
+    try:
+        cur = client_request({"cmd": "get-config"}).get("config", {})
+        chosen = resolve_camera(cur)
+    except DaemonError:
+        chosen = resolve_camera(DEFAULT_CONFIG)
+    print(f"default camera: {chosen}\n")
+    v4l2 = which("v4l2-ctl")
+    for dev in devs:
+        label = ""
+        if v4l2:
+            r = subprocess.run([v4l2, "-d", dev, "--info"],
+                               capture_output=True, text=True)
+            m = re.search(r"Card type\s*:\s*(.+)", r.stdout)
+            if m:
+                label = "  " + m.group(1).strip()
+        mark = " *" if dev == chosen else "  "
+        print(f"{mark}{dev}{label}")
+    return 0
+
+
 def cmd_where(args):
     try:
         st = client_request({"cmd": "status"})
@@ -959,7 +1198,7 @@ def cmd_where(args):
 
 
 def cmd_doctor(args):
-    """Health check: dependencies, daemon, hotkey, stealth prediction."""
+    """Health check: dependencies, daemon, hotkeys, stealth prediction."""
     ok = True
 
     def check(label, good, detail=""):
@@ -973,6 +1212,9 @@ def cmd_doctor(args):
     check("ffmpeg installed", bool(which("ffmpeg")), which("ffmpeg") or "missing")
     check("pactl installed", bool(which("pactl")), which("pactl") or "missing")
     check("keyd installed", bool(which("keyd")), which("keyd") or "missing")
+    cams = sorted(glob.glob("/dev/video*"))
+    check("camera device present", bool(cams),
+          ", ".join(cams) if cams else "no /dev/video* (video recording won't work)")
     check("zenity (GUI folder picker)", bool(which("zenity")),
           which("zenity") or "optional, missing")
     check("notify-send (notifications)", bool(which("notify-send")),
@@ -990,10 +1232,14 @@ def cmd_doctor(args):
         st = client_request({"cmd": "status"})
         check("output folder writable",
               _dir_writable(st["output_dir"]), st["output_dir"])
-        print(f"\n  hotkey        : {st['hotkey']}")
+        print(f"\n  audio hotkey  : {st['hotkey']}")
+        print(f"  video hotkey  : {st['video_hotkey']}")
+        print(f"  camera        : {st['camera']}")
+        print(f"  mic volume    : {st['mic_volume']}%")
         print(f"  stealth       : {'on' if st['stealth'] else 'off'}")
         print(f"  notify        : {'on' if st.get('notify', True) else 'off'}")
-        print(f"  current state : {st['state']}")
+        print(f"  audio state   : {'recording' if st['audio']['recording'] else 'idle'}")
+        print(f"  video state   : {'recording' if st['video']['recording'] else 'idle'}")
 
     # keyd hotkey wiring present?
     payload = os.path.exists(KEYD_INCLUDE_FILE)
@@ -1004,9 +1250,11 @@ def cmd_doctor(args):
         for p in _keyd_conf_files()
     )
     check("keyd hotkey payload installed", payload, KEYD_INCLUDE_FILE)
-    check("keyd hotkey wired into a config", included,
+    check("keyd hotkeys wired into a config", included,
           "run: sudo keyrec apply-hotkey" if not included else "")
 
+    print("\n  note: a camera's activity LED is hardware-controlled and lights")
+    print("        whenever video records — it cannot be hidden in software.")
     print()
     print("all good ✅" if ok else "some checks failed ⚠")
     return 0 if ok else 1
@@ -1034,15 +1282,19 @@ def cmd_apply_hotkey(args):
         return 1  # not reached
     # Prefer the running daemon's effective config (it merges the right user
     # override regardless of whose home root's process sees); fall back to disk.
-    hotkey = None
+    cfg = None
     try:
-        hotkey = client_request({"cmd": "get-config"}).get("config", {}).get("hotkey")
+        cfg = client_request({"cmd": "get-config"}).get("config")
     except Exception:
         pass
-    if not hotkey:
-        hotkey = load_config()["hotkey"]
+    if not cfg:
+        cfg = load_config()
+    bindings = [
+        (cfg["hotkey"], _toggle_cmd("audio")),
+        (cfg["video_hotkey"], _toggle_cmd("video")),
+    ]
     try:
-        content = render_keyd_include(hotkey)
+        content = render_keyd_include(bindings)
     except ValueError as exc:
         print("error:", exc, file=sys.stderr)
         return 1
@@ -1064,7 +1316,8 @@ def cmd_apply_hotkey(args):
         print("    Add `include keyrec` after the [ids] line of your keyd config,")
         print("    or create /etc/keyd/default.conf with:  [ids]\\n*")
     _keyd_reload()
-    print(f"keyd reloaded — press {hotkey} to toggle recording.")
+    print(f"keyd reloaded — {cfg['hotkey']} toggles audio, "
+          f"{cfg['video_hotkey']} toggles video.")
     return 0
 
 
@@ -1083,7 +1336,7 @@ def cmd_unbind_hotkey(args):
     except OSError:
         pass
     _keyd_reload()
-    print("hotkey unbound.")
+    print("hotkeys unbound.")
     return 0
 
 
@@ -1124,21 +1377,23 @@ def cmd_version(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="keyrec",
-        description="Hotkey-toggled microphone recorder that hides GNOME's mic indicator.",
+        description="Hotkey-toggled microphone + camera recorder for Linux/GNOME.",
     )
     p.add_argument("--version", action="store_true", help="print version and exit")
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("daemon", help="run the recording daemon (used by systemd)")
 
-    sp = sub.add_parser("toggle", help="start/stop recording")
-    sp.add_argument("--quiet", action="store_true")
-    sp.add_argument("--source", default=None, help=argparse.SUPPRESS)  # e.g. hotkey
+    def _add_target(sp):
+        sp.add_argument("target", nargs="?", default="audio",
+                        choices=["audio", "video"],
+                        help="which recorder to act on (default: audio)")
+        sp.add_argument("--quiet", action="store_true")
+        sp.add_argument("--source", default=None, help=argparse.SUPPRESS)  # e.g. hotkey
 
-    sp = sub.add_parser("start", help="start recording")
-    sp.add_argument("--quiet", action="store_true")
-    sp = sub.add_parser("stop", help="stop recording")
-    sp.add_argument("--quiet", action="store_true")
+    _add_target(sub.add_parser("toggle", help="start/stop a recorder (audio|video)"))
+    _add_target(sub.add_parser("start", help="start a recorder (audio|video)"))
+    _add_target(sub.add_parser("stop", help="stop a recorder (audio|video)"))
 
     sp = sub.add_parser("status", help="show current recording state")
     sp.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1160,13 +1415,14 @@ def build_parser():
                         help="turn start/stop notifications on|off (no arg = toggle)")
     sp.add_argument("state", nargs="?", help="on | off | toggle (default: toggle)")
 
-    sub.add_parser("sources", help="list available input sources")
+    sub.add_parser("sources", help="list available microphone sources")
+    sub.add_parser("cameras", help="list available camera devices")
     sub.add_parser("where", help="print the recordings folder")
     sub.add_parser("doctor", help="run health checks")
     sub.add_parser("apply-hotkey",
-                   help="(re)install the keyd hotkey binding (uses sudo)")
+                   help="(re)install the keyd hotkey bindings (uses sudo)")
     sub.add_parser("unbind-hotkey",
-                   help="remove the keyd hotkey binding (uses sudo)")
+                   help="remove the keyd hotkey bindings (uses sudo)")
     sub.add_parser("version", help="print version")
 
     return p
@@ -1182,6 +1438,7 @@ DISPATCH = {
     "set-dir": cmd_set_dir,
     "notify": cmd_notify,
     "sources": cmd_sources,
+    "cameras": cmd_cameras,
     "where": cmd_where,
     "doctor": cmd_doctor,
     "apply-hotkey": cmd_apply_hotkey,

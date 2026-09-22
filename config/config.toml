@@ -7,7 +7,34 @@
 # You can also edit this file directly, then run:  systemctl reload keyrec
 
 # Where recordings are written. "~" expands to the recording user's home.
+# Both audio and video files land here.
 output_dir = "~/Documents/Recordings"
+
+
+# --- Shared microphone settings ------------------------------------------
+# These describe the ONE microphone. Both the audio recorder and the video
+# recorder's audio track read from the same source with these settings, so the
+# two never fight over the device. The volume below is applied as a per-stream
+# software gain — it never changes your real system mic level, which is why two
+# simultaneous captures don't interfere with each other.
+
+# PulseAudio/PipeWire source to capture. "default" follows the system default
+# input. Run `keyrec sources` to see the available names.
+source = "default"
+
+# 1 = mono (good for a microphone), 2 = stereo
+channels = 1
+
+# Sample rate in Hz.
+samplerate = 48000
+
+# Microphone volume as a percentage. 100 = capture unchanged (the default for
+# both this config and per-user setups). Applied in software to what's
+# recorded; your actual device volume is left alone.
+mic_volume = 100
+
+
+# --- Audio recording  (hotkey: Ctrl+Alt+6) -------------------------------
 
 # Audio format:  opus | vorbis | mp3 | aac | flac | wav
 #   opus  -> tiny, excellent for voice (default)
@@ -18,31 +45,58 @@ format = "opus"
 # Target bitrate for the lossy formats (opus / mp3 / aac).
 bitrate = "48k"
 
-# 1 = mono (good for a microphone), 2 = stereo
-channels = 1
+# Global hotkey that toggles AUDIO recording, in keyd binding syntax. Wired
+# into your keyd config as a non-destructive `include` by `keyrec apply-hotkey`
+# (run for you by setup.sh, and again whenever you change this value).
+hotkey = "control+alt+6"
 
-# Sample rate in Hz.
-samplerate = 48000
 
-# PulseAudio/PipeWire source to capture. "default" follows the system default
-# input. Run `keyrec sources` to see the available names.
-source = "default"
+# --- Video recording  (hotkey: Ctrl+Alt+7) -------------------------------
+# NOTE: a camera's physical activity LED is wired to the sensor in hardware. It
+# lights whenever the camera captures and CANNOT be turned off in software —
+# there is no stealth mode for video, only for the microphone icon.
 
-# Recording files are named  <prefix>_<YYYY-MM-DD_HH-MM-SS>.<ext>
+# Camera device. "default" picks the first /dev/video* device. Run
+# `keyrec cameras` to list them.
+camera = "default"
+
+# Video container/codec:  mp4 | mkv | webm
+#   mp4  -> H.264 video + AAC audio, plays everywhere (default)
+#   mkv  -> H.264 in Matroska
+#   webm -> VP9 video + Opus audio
+video_format = "mp4"
+
+# Capture resolution "WIDTHxHEIGHT" (e.g. 1280x720), or "default" to let the
+# camera choose what it supports.
+video_resolution = "default"
+
+# Frame rate in fps (e.g. 30), or "default" to let the camera choose.
+video_framerate = "default"
+
+# Target video bitrate.
+video_bitrate = "4M"
+
+# Include the microphone in the video. true (default) records audio+video;
+# set false to record silent video. Audio recording (above) is never muted.
+video_audio = true
+
+# Global hotkey that toggles VIDEO recording, in keyd binding syntax.
+video_hotkey = "control+alt+7"
+
+
+# --- Shared behaviour ----------------------------------------------------
+
+# Recording files are named  <prefix>[_video]_<YYYY-MM-DD_HH-MM-SS>.<ext>
 filename_prefix = "keyrec"
 
-# Hide GNOME's top-bar microphone indicator while recording.
+# Hide GNOME's top-bar microphone indicator while the microphone is capturing.
 # When true, the capture stream is tagged with an application id the GNOME
-# shell treats as internal, so no "microphone in use" icon appears.
+# shell treats as internal, so no "microphone in use" icon appears. This only
+# affects the mic icon — it cannot hide the camera LED.
 stealth = true
 stealth_app_id = "org.gnome.VolumeControl"
 
-# Global hotkey, in keyd binding syntax. Wired into your keyd config as a
-# non-destructive `include` by `keyrec apply-hotkey` (run for you by setup.sh,
-# and again automatically whenever you change this value).
-hotkey = "control+alt+5"
-
-# Show a desktop notification when recording starts and stops. Because the
+# Show a desktop notification when a recording starts and stops. Because the
 # mic indicator is hidden in stealth mode, this is your visible cue.
 # Toggle it any time with:  keyrec notify off  (or on / toggle)
 notify = true

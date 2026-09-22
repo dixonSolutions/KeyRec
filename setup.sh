@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cat <<BANNER
 
-${B}KeyRec${N} — hotkey-toggled microphone recorder ${DIM}(hides GNOME's mic indicator)${N}
+${B}KeyRec${N} — hotkey-toggled microphone + camera recorder ${DIM}(hides GNOME's mic indicator)${N}
 ${DIM}------------------------------------------------------------------${N}
 BANNER
 
@@ -130,11 +130,14 @@ REC_DIR="${REC_DIR/#\~/$TARGET_HOME}"
 sudo -u "$TARGET_USER" mkdir -p "$REC_DIR" 2>/dev/null || mkdir -p "$REC_DIR"
 ok "recordings folder: $REC_DIR"
 
-# --- hotkey -----------------------------------------------------------------
-step "Global hotkey"
-say "  keyd syntax, e.g.  control+alt+5   super+r   control+alt+shift+m"
-HOTKEY="$(ask 'Hotkey to toggle recording' 'control+alt+5')"
-ok "hotkey: $HOTKEY"
+# --- hotkeys ----------------------------------------------------------------
+step "Global hotkeys"
+say "  keyd syntax, e.g.  control+alt+6   super+r   control+alt+shift+m"
+HOTKEY="$(ask 'Hotkey to toggle AUDIO recording' 'control+alt+6')"
+VIDEO_HOTKEY="$(ask 'Hotkey to toggle VIDEO recording' 'control+alt+7')"
+ok "audio hotkey: $HOTKEY"
+ok "video hotkey: $VIDEO_HOTKEY"
+say "  ${DIM}Note: video's camera LED is hardware-controlled and stays on while recording.${N}"
 
 # --- write per-user overrides so the choices above take effect -------------
 step "Saving your choices"
@@ -144,7 +147,9 @@ cat > "$USER_CFG_DIR/config.toml" <<EOF
 # KeyRec user configuration (overrides /etc/keyrec/config.toml)
 # Written by setup.sh. Change values with \`keyrec config set KEY VALUE\`.
 output_dir = "$REC_DIR"
+mic_volume = 100
 hotkey = "$HOTKEY"
+video_hotkey = "$VIDEO_HOTKEY"
 EOF
 chown "$TARGET_USER:$TARGET_GROUP" "$USER_CFG_DIR/config.toml"
 ok "$USER_CFG_DIR/config.toml"
@@ -188,18 +193,22 @@ cat <<DONE
 
 ${G}${B}KeyRec is installed.${N}
 
-  ${B}Press ${HOTKEY}${N} to start recording; press it again to stop.
+  ${B}Press ${HOTKEY}${N} to toggle audio recording.
+  ${B}Press ${VIDEO_HOTKEY}${N} to toggle video recording (camera + mic).
+  Both are independent and can run at the same time.
   Files are saved to: ${B}$REC_DIR${N}
 
   Handy commands:
-    ${DIM}keyrec status${N}              show whether it is recording right now
-    ${DIM}keyrec toggle${N}              start/stop from the terminal
-    ${DIM}keyrec config path${N}         pick the folder with a GUI dialog
-    ${DIM}keyrec config set format flac${N}   change anything (see: keyrec config get)
-    ${DIM}keyrec doctor${N}              re-run health checks
-    ${DIM}keyrec sources${N}             list microphones
+    ${DIM}keyrec status${N}               show what is recording right now
+    ${DIM}keyrec toggle video${N}         start/stop video from the terminal
+    ${DIM}keyrec config path${N}          pick the folder with a GUI dialog
+    ${DIM}keyrec config set mic_volume 100${N}   mic gain % (shared by both)
+    ${DIM}keyrec config set video_audio false${N}  record silent video
+    ${DIM}keyrec doctor${N}               re-run health checks
+    ${DIM}keyrec sources / keyrec cameras${N}   list mics / cameras
 
   In stealth mode the GNOME microphone icon stays hidden while recording,
   so the desktop notification (and ${DIM}keyrec status${N}) is your cue.
+  ${DIM}The camera's activity LED is hardware-controlled and cannot be hidden.${N}
 
 DONE
