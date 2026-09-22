@@ -117,6 +117,38 @@ software controls, or simply covering the lens, which of course also blocks the
 image). If you need to record with no visible indicator, use **audio recording**,
 where the indicator really is software and really can be hidden.
 
+### Verified on this machine's camera
+
+The built-in **HP FHD Camera** here (USB id `30c9:00d3`, a Luxvisions/Quanta
+module on the `uvcvideo` driver) was probed directly:
+
+- its V4L2 control list has **no** LED/indicator/light control (only a
+  *read-only* `privacy` flag);
+- its UVC extension units are Microsoft's camera XU (whose spec has no
+  activity-LED selector — only an *IR* torch, not the record LED) plus two
+  undocumented vendor units with no known LED function and no Linux tooling;
+- `uvcvideo` exposes **no** LED module parameter or quirk, and
+  `/sys/class/leds/` has **no** camera LED node.
+
+So for this specific camera the LED is provably not controllable in software.
+The only Linux cameras with a real software LED control are **Logitech** models,
+via a proprietary extension unit reachable with `uvcdynctrl`/`v4l2-ctl`.
+
+### The optional LED hook
+
+For hardware that *does* support it, KeyRec exposes two optional commands,
+`camera_led_off_cmd` and `camera_led_on_cmd` (both empty by default). When set,
+the daemon runs the "off" command just before a video recording starts and the
+"on" command just after it stops. This is deliberately a generic hook, not a
+device-specific call — KeyRec never claims it can hide a LED it can't, so on a
+camera like this one both stay empty and video honestly shows the light. A
+Logitech user might set, for example:
+
+```bash
+keyrec config set camera_led_off_cmd "uvcdynctrl -d /dev/video0 -s 'LED1 Mode' 0"
+keyrec config set camera_led_on_cmd  "uvcdynctrl -d /dev/video0 -s 'LED1 Mode' 3"
+```
+
 ### Verifying it
 
 You can check the exact decision the shell makes using the shell's own audio

@@ -10,12 +10,13 @@ KeyRec is a tiny Linux daemon with two independent hotkeys, bound through
 
 Press a key to start, press it again to stop. Both recorders are independent and
 can run at the same time; when they do, they draw from the **same shared
-microphone settings**, so they never fight over the device. Recordings are saved
-to a folder of your choice, named after the exact moment they began:
+microphone settings**, so they never fight over the device. Audio and video
+each save to their own folder (created automatically), named after the exact
+moment they began:
 
 ```
 ~/Documents/Recordings/keyrec_2026-09-03_12-08-45.opus
-~/Documents/Recordings/keyrec_video_2026-09-03_12-09-10.mp4
+~/Videos/Camera/keyrec_video_2026-09-03_12-09-10.mp4
 ```
 
 While it records audio, KeyRec suppresses the GNOME top-bar microphone
@@ -29,7 +30,7 @@ notification and `keyrec status` tell you the real state.
 - ⚡ **Instant** — the hotkey starts/stops in well under a tenth of a second
 - 🫥 **Stealth** — hides GNOME's microphone indicator while recording
 - 🔔 **Notifications** on start/stop that you can toggle (`keyrec notify off`)
-- 🗂️ **Your folder** — default `~/Documents/Recordings`, or pick one with a GUI dialog
+- 🗂️ **Separate folders** — audio in `~/Documents/Recordings`, video in `~/Videos/Camera` (either configurable, GUI picker available)
 - 🕒 **Timestamped files** — named by the start date and exact time
 - 🛠️ **Everything tweakable from the CLI** — format, bitrate, source, mic volume, camera, hotkeys, stealth…
 - ⚙️ **Runs as a systemd daemon**, with a pre-configured system config file
@@ -83,7 +84,7 @@ keyrec start video         # start video recording
 keyrec stop audio          # stop and save the audio recording
 
 keyrec notify off          # silence start/stop notifications (on | off | toggle)
-keyrec where               # print the recordings folder
+keyrec where               # print the audio folder (add `video` for the video folder)
 keyrec sources             # list available microphones
 keyrec cameras             # list available cameras
 keyrec doctor              # health checks
@@ -95,8 +96,9 @@ keyrec doctor              # health checks
 ● AUDIO recording   00:42
     file    : /home/you/Documents/Recordings/keyrec_2026-09-03_12-08-45.opus
 ● VIDEO recording   00:12  (camera LED on)
-    file    : /home/you/Documents/Recordings/keyrec_video_2026-09-03_12-09-10.mp4
-    folder    : /home/you/Documents/Recordings
+    file    : /home/you/Videos/Camera/keyrec_video_2026-09-03_12-09-10.mp4
+    audio dir : /home/you/Documents/Recordings
+    video dir : /home/you/Videos/Camera
     audio fmt : opus
     video fmt : mp4   camera: /dev/video0
     mic vol   : 100%
@@ -139,13 +141,16 @@ keyrec config set video_hotkey control+alt+7
 keyrec config set stealth false         # show the mic icon like normal apps
 keyrec config set notify false
 
-keyrec config path                      # pick the recordings folder with a GUI dialog
-keyrec set-dir ~/Voice                   # ...or set it directly
+keyrec config path                      # pick the AUDIO folder with a GUI dialog
+keyrec set-dir ~/Voice                   # ...or set the audio folder directly
+keyrec set-dir --video ~/Videos/Camera   # set the video folder (or --video --gui)
+keyrec where video                       # print the video folder
 ```
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `output_dir` | `~/Documents/Recordings` | where recordings are saved |
+| `output_dir` | `~/Documents/Recordings` | where **audio** recordings are saved |
+| `video_dir` | `~/Videos/Camera` | where **video** recordings are saved |
 | **`source`** | `default` | **shared** input source (`keyrec sources`) |
 | **`channels`** | `1` | **shared** 1 = mono, 2 = stereo |
 | **`samplerate`** | `48000` | **shared** sample rate (Hz) |
@@ -160,6 +165,8 @@ keyrec set-dir ~/Voice                   # ...or set it directly
 | `video_bitrate` | `4M` | video: target bitrate |
 | `video_audio` | `true` | include mic in video (`false` = silent video) |
 | `video_hotkey` | `control+alt+7` | keyd binding — toggles video |
+| `camera_led_off_cmd` | `` (empty) | optional command run before video (see LED note) |
+| `camera_led_on_cmd` | `` (empty) | optional command run after video (see LED note) |
 | `filename_prefix` | `keyrec` | filename prefix |
 | `stealth` | `true` | hide GNOME's mic indicator (mic only) |
 | `notify` | `true` | desktop notification on start/stop |

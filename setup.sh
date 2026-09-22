@@ -48,9 +48,9 @@ ok "installing for ${B}$TARGET_USER${N} (uid $TARGET_UID, home $TARGET_HOME)"
 
 # --- dependencies -----------------------------------------------------------
 step "Checking dependencies"
-declare -A PKG=( [ffmpeg]=ffmpeg [pactl]=pulseaudio-utils [keyd]=keyd [zenity]=zenity [notify-send]=libnotify-bin )
+declare -A PKG=( [ffmpeg]=ffmpeg [pactl]=pulseaudio-utils [keyd]=keyd [zenity]=zenity [notify-send]=libnotify-bin [v4l2-ctl]=v4l-utils )
 MISSING=()
-for cmd in ffmpeg pactl keyd zenity notify-send; do
+for cmd in ffmpeg pactl keyd zenity notify-send v4l2-ctl; do
     if command -v "$cmd" >/dev/null 2>&1; then
         ok "$cmd"
     else
@@ -102,33 +102,44 @@ else
     ok "/etc/keyrec/config.toml"
 fi
 
-# --- choose the recordings folder ------------------------------------------
+# --- choose the recordings folders (audio + video, kept separate) ----------
+# Prompt for one folder (default / GUI / typed), create it as the target user,
+# and echo the final path. $1 = human label, $2 = default path.
+choose_dir() {
+    local label="$1" def="$2" choice picked typed dir="$2"
+    # All prompts/menus go to stderr; ONLY the chosen path is printed to stdout,
+    # so `dir="$(choose_dir ...)"` captures the path and nothing else.
+    say "  ${B}$label folder${N}" >&2
+    say "    1) Default  ($def)" >&2
+    say "    2) Pick a folder with a GUI dialog" >&2
+    say "    3) Type a path" >&2
+    choice="$(ask "  Choose 1/2/3 for $label" 1)"
+    case "$choice" in
+        2)
+            picked="$(sudo -u "$TARGET_USER" \
+                XDG_RUNTIME_DIR="/run/user/$TARGET_UID" \
+                DISPLAY=":0" WAYLAND_DISPLAY="wayland-0" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TARGET_UID/bus" \
+                zenity --file-selection --directory \
+                --title="KeyRec — choose $label folder" 2>/dev/null || true)"
+            [[ -n "$picked" ]] && dir="$picked" || warn "no folder picked; using default" >&2
+            ;;
+        3)
+            typed="$(ask "  $label folder path" "$def")"
+            [[ -n "$typed" ]] && dir="$typed"
+            ;;
+    esac
+    # expand a leading ~ for the target user, then create it
+    dir="${dir/#\~/$TARGET_HOME}"
+    sudo -u "$TARGET_USER" mkdir -p "$dir" 2>/dev/null || mkdir -p "$dir"
+    printf '%s' "$dir"
+}
+
 step "Where should recordings be saved?"
-DEFAULT_DIR="$TARGET_HOME/Documents/Recordings"
-say "  1) Default  ($DEFAULT_DIR)"
-say "  2) Pick a folder with a GUI dialog"
-say "  3) Type a path"
-choice="$(ask 'Choose 1/2/3' 1)"
-REC_DIR="$DEFAULT_DIR"
-case "$choice" in
-    2)
-        picked="$(sudo -u "$TARGET_USER" \
-            XDG_RUNTIME_DIR="/run/user/$TARGET_UID" \
-            DISPLAY=":0" WAYLAND_DISPLAY="wayland-0" \
-            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$TARGET_UID/bus" \
-            zenity --file-selection --directory \
-            --title="KeyRec — choose recordings folder" 2>/dev/null || true)"
-        [[ -n "$picked" ]] && REC_DIR="$picked" || warn "no folder picked; using default"
-        ;;
-    3)
-        typed="$(ask 'Folder path' "$DEFAULT_DIR")"
-        [[ -n "$typed" ]] && REC_DIR="$typed"
-        ;;
-esac
-# expand a leading ~ for the target user
-REC_DIR="${REC_DIR/#\~/$TARGET_HOME}"
-sudo -u "$TARGET_USER" mkdir -p "$REC_DIR" 2>/dev/null || mkdir -p "$REC_DIR"
-ok "recordings folder: $REC_DIR"
+REC_DIR="$(choose_dir 'Audio recordings' "$TARGET_HOME/Documents/Recordings")"
+ok "audio folder: $REC_DIR"
+VIDEO_DIR="$(choose_dir 'Video recordings' "$TARGET_HOME/Videos/Camera")"
+ok "video folder: $VIDEO_DIR"
 
 # --- hotkeys ----------------------------------------------------------------
 step "Global hotkeys"
@@ -147,6 +158,7 @@ cat > "$USER_CFG_DIR/config.toml" <<EOF
 # KeyRec user configuration (overrides /etc/keyrec/config.toml)
 # Written by setup.sh. Change values with \`keyrec config set KEY VALUE\`.
 output_dir = "$REC_DIR"
+video_dir = "$VIDEO_DIR"
 mic_volume = 100
 hotkey = "$HOTKEY"
 video_hotkey = "$VIDEO_HOTKEY"
@@ -196,12 +208,13 @@ ${G}${B}KeyRec is installed.${N}
   ${B}Press ${HOTKEY}${N} to toggle audio recording.
   ${B}Press ${VIDEO_HOTKEY}${N} to toggle video recording (camera + mic).
   Both are independent and can run at the same time.
-  Files are saved to: ${B}$REC_DIR${N}
+  Audio is saved to: ${B}$REC_DIR${N}
+  Video is saved to: ${B}$VIDEO_DIR${N}
 
   Handy commands:
     ${DIM}keyrec status${N}               show what is recording right now
     ${DIM}keyrec toggle video${N}         start/stop video from the terminal
-    ${DIM}keyrec config path${N}          pick the folder with a GUI dialog
+    ${DIM}keyrec set-dir --video PATH${N}   change the video folder (audio: set-dir PATH)
     ${DIM}keyrec config set mic_volume 100${N}   mic gain % (shared by both)
     ${DIM}keyrec config set video_audio false${N}  record silent video
     ${DIM}keyrec doctor${N}               re-run health checks

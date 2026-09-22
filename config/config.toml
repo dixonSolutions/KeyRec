@@ -6,9 +6,13 @@
 #
 # You can also edit this file directly, then run:  systemctl reload keyrec
 
-# Where recordings are written. "~" expands to the recording user's home.
-# Both audio and video files land here.
+# Where AUDIO recordings are written. "~" expands to the recording user's home.
+# The folder is created automatically if it doesn't exist yet.
 output_dir = "~/Documents/Recordings"
+
+# Where VIDEO recordings are written (kept separate from audio). Also created
+# automatically. Change either folder with `keyrec set-dir` / `set-dir --video`.
+video_dir = "~/Videos/Camera"
 
 
 # --- Shared microphone settings ------------------------------------------
@@ -82,6 +86,17 @@ video_audio = true
 
 # Global hotkey that toggles VIDEO recording, in keyd binding syntax.
 video_hotkey = "control+alt+7"
+
+# Optional shell commands run just before video recording starts and just after
+# it stops — intended for turning a camera's activity LED off/on. Both are EMPTY
+# by default and KeyRec makes NO promise the LED can be hidden: on most webcams
+# (this machine's HP FHD Camera, USB id 30c9:00d3, included) the LED is wired to
+# the sensor in firmware and no software can toggle it — verified against its
+# V4L2 controls, UVC extension units, and kernel driver. A minority of cameras
+# (notably Logitech) expose an LED control via v4l2-ctl/uvcdynctrl; if yours
+# does, put the command here. Leave empty otherwise.
+camera_led_off_cmd = ""
+camera_led_on_cmd = ""
 
 
 # --- Shared behaviour ----------------------------------------------------
